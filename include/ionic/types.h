@@ -4,9 +4,6 @@
 #include <assert.h>
 #include <stddef.h>
 
-#ifndef IONIC_MAX_RANK
-#define IONIC_MAX_RANK 8
-#endif
 
 enum ionic_data_type {
     IONIC_DATA_TYPE_BOOL,
@@ -34,6 +31,10 @@ enum ionic_data_type {
     IONIC_DATA_TYPE_UNKNOWN
 };
 typedef enum ionic_data_type ionic_data_type_t;
+
+#ifndef IONIC_MAX_RANK
+#define IONIC_MAX_RANK 8
+#endif
 
 struct ionic_tensor {
     size_t start;

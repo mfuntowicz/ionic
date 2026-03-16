@@ -33,7 +33,7 @@ extern "C" {
 #endif
 #endif
 
-#define IONIC_FALSE   0u
+#define IONIC_FALSE        0u
 #define IONIC_UNUSED(expr) (void)(expr)
 
 #if defined(_MSC_VER)
@@ -48,21 +48,32 @@ extern "C" {
 /* Returns the version of the library as a single integer as MAJOR * 10000 + MINOR * 100 + PATCH */
 IONIC_INLINE unsigned ionic_version(void) NO_EXCEPT { return IONIC_VERSION; }
 
-#include "types.h"
-#include "logging.h"
+#include "error.h"
 
-struct ionic_context {
-    ionic_logger_t logger;
-};
-typedef struct ionic_context ionic_context_t;
+IONIC_EXTERN IONIC_INLINE unsigned char ionic_has_error(ionic_error_t *error) NO_EXCEPT { return error->kind != IONIC_ERROR_CODE_SUCCESS; }
+
+#include "logging.h"
 
 /*
  * Initialise a logger from the IONIC_LOG environment variable.
  * If the variable is absent or unrecognised the level defaults to OFF.
  */
- IONIC_EXTERN void ionic_logger_init(ionic_logger_t *logger) NO_EXCEPT;
- IONIC_EXTERN void ionic_log(ionic_logger_t *logger, ionic_log_level_t level, const char *file, int line, const char *fmt, ...) NO_EXCEPT;
- IONIC_EXTERN unsigned char ionic_log_level_is_enabled(ionic_logger_t *logger, ionic_log_level_t level) NO_EXCEPT;
+IONIC_EXTERN void ionic_logger_init(ionic_logger_t *logger) NO_EXCEPT;
+IONIC_EXTERN void ionic_log(ionic_logger_t *logger, ionic_log_level_t level, const char *file, int line, const char *fmt, ...) NO_EXCEPT;
+IONIC_EXTERN unsigned char ionic_log_level_is_enabled(ionic_logger_t *logger, ionic_log_level_t level) NO_EXCEPT;
+
+#include "types.h"
+
+struct ionic_context {
+    struct ionic_logger logger;
+    struct ionic_error  error;
+};
+
+typedef struct ionic_context ionic_context_t;
+
+IONIC_EXTERN void ionic_context_init(ionic_context_t *context) NO_EXCEPT;
+IONIC_EXTERN void ionic_context_destroy(ionic_context_t *context) NO_EXCEPT;
+
 #ifdef __cplusplus
 }
 #endif

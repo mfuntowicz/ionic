@@ -3,6 +3,7 @@ project(ionic VERSION 0.1.0 LANGUAGES C)
 
 include(FetchContent)
 
+option(IONIC_BUILD_EXAMPLES "Build examples" OFF)
 option(IONIC_BUILD_TESTS "Build tests" OFF)
 option(IONIC_ENABLE_TESTS_SANITIZERS "Flag indicating if cmake should enable sanitizers" OFF)
 
@@ -10,8 +11,8 @@ option(IONIC_ENABLE_CUDA "Enable CUDA support" OFF)
 option(IONIC_ENABLE_SAFETENSORS "Enable Safetensors support" OFF)
 
 set(IONIC_LIBS "")
-set(IONIC_SOURCES "lib/memory.c" "lib/logging.c")
-set(IONIC_HEADERS "include/ionic/ionic.h" "include/ionic/types.h" "include/ionic/logging.h")
+set(IONIC_SOURCES lib/context.c lib/memory.c lib/logging.c)
+set(IONIC_HEADERS include/ionic/ionic.h include/ionic/types.h include/ionic/logging.h)
 
 if(IONIC_ENABLE_CUDA)
     message(STATUS "CUDA support enabled")
@@ -24,7 +25,7 @@ if(IONIC_ENABLE_SAFETENSORS)
     
     include(cmake/yyjson.cmake)
     list(APPEND IONIC_LIBS yyjson)
-    list(APPEND IONIC_SOURCES "lib/safetensors.c")
+    list(APPEND IONIC_SOURCES lib/safetensors.c)
 
     add_compile_definitions(__IONIC_SAFETENSORS_ENABLED__=1)
     add_compile_definitions(__IONIC_TENSORS_ENABLED__=1)
@@ -36,6 +37,11 @@ target_include_directories(ionic PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
+
+if(IONIC_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+    message(STATUS "Examples enabled")
+endif()
 
 if(IONIC_BUILD_TESTS)
     enable_testing()

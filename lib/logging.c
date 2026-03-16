@@ -6,7 +6,7 @@
 #include <stdio.h>
 
 static const char *const LEVEL_NAMES[] = {
-    "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "OFF"
+    "OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
 };
 
 static inline ionic_log_level_t ionic_log_level_from_str(const char *s) {
