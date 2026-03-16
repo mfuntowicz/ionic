@@ -49,7 +49,20 @@ extern "C" {
 IONIC_INLINE unsigned ionic_version(void) NO_EXCEPT { return IONIC_VERSION; }
 
 #include "types.h"
+#include "logging.h"
 
+struct ionic_context {
+    ionic_logger_t logger;
+};
+typedef struct ionic_context ionic_context_t;
+
+/*
+ * Initialise a logger from the IONIC_LOG environment variable.
+ * If the variable is absent or unrecognised the level defaults to OFF.
+ */
+ IONIC_EXTERN void ionic_logger_init(ionic_logger_t *logger) NO_EXCEPT;
+ IONIC_EXTERN void ionic_log(ionic_logger_t *logger, ionic_log_level_t level, const char *file, int line, const char *fmt, ...) NO_EXCEPT;
+ IONIC_EXTERN unsigned char ionic_log_level_is_enabled(ionic_logger_t *logger, ionic_log_level_t level) NO_EXCEPT;
 #ifdef __cplusplus
 }
 #endif
