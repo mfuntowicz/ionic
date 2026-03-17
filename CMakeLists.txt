@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.26)
 project(ionic VERSION 0.1.0 LANGUAGES C)
 
 include(FetchContent)
+include(cmake/numa.cmake)
 
 option(IONIC_BUILD_EXAMPLES "Build examples" OFF)
 option(IONIC_BUILD_TESTS "Build tests" OFF)
@@ -10,9 +11,13 @@ option(IONIC_ENABLE_TESTS_SANITIZERS "Flag indicating if cmake should enable san
 option(IONIC_ENABLE_CUDA "Enable CUDA support" OFF)
 option(IONIC_ENABLE_SAFETENSORS "Enable Safetensors support" OFF)
 
-set(IONIC_LIBS "")
+set(IONIC_LIBS "NUMA::numa")
 set(IONIC_SOURCES lib/context.c lib/memory.c lib/logging.c)
-set(IONIC_HEADERS include/ionic/ionic.h include/ionic/types.h include/ionic/logging.h)
+set(IONIC_HEADERS include/ionic/ionic.h include/ionic/types.h include/ionic/logging.h include/ionic/topology.h)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND IONIC_SOURCES lib/platform/linux/topology.c)
+endif()
 
 if(IONIC_ENABLE_CUDA)
     message(STATUS "CUDA support enabled")

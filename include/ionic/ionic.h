@@ -58,21 +58,23 @@ IONIC_EXTERN IONIC_INLINE unsigned char ionic_has_error(ionic_error_t *error) NO
  * Initialise a logger from the IONIC_LOG environment variable.
  * If the variable is absent or unrecognised the level defaults to OFF.
  */
-IONIC_EXTERN void ionic_logger_init(ionic_logger_t *logger) NO_EXCEPT;
+IONIC_EXTERN void ionic_logger_init(ionic_logger_t *) NO_EXCEPT;
 IONIC_EXTERN void ionic_log(ionic_logger_t *logger, ionic_log_level_t level, const char *file, int line, const char *fmt, ...) NO_EXCEPT;
-IONIC_EXTERN unsigned char ionic_log_level_is_enabled(ionic_logger_t *logger, ionic_log_level_t level) NO_EXCEPT;
+IONIC_EXTERN unsigned char ionic_log_level_is_enabled(ionic_logger_t *, ionic_log_level_t) NO_EXCEPT;
 
 #include "types.h"
+#include "topology.h"
 
 struct ionic_context {
     struct ionic_logger logger;
     struct ionic_error  error;
+    struct ionic_topology topology;
 };
 
 typedef struct ionic_context ionic_context_t;
 
-IONIC_EXTERN void ionic_context_init(ionic_context_t *context) NO_EXCEPT;
-IONIC_EXTERN void ionic_context_destroy(ionic_context_t *context) NO_EXCEPT;
+IONIC_EXTERN void ionic_context_init(ionic_context_t *) NO_EXCEPT;
+IONIC_EXTERN void ionic_context_destroy(ionic_context_t *) NO_EXCEPT;
 
 #ifdef __cplusplus
 }
