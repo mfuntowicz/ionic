@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <yyjson.h>
 
 #include "ionic/error.h"
@@ -14,6 +15,34 @@
 
 
 #define IONIC_SAFETENSORS_EVENT_TAG "safetensors"
+
+
+static inline size_t ionic_path_parent(const char *path, char *dst, size_t dst_size)
+{
+    const char *sep = strrchr(path, '/');
+    if (!sep)
+        return 0;
+
+    size_t len = (size_t)(sep - path + 1);
+    if (len >= dst_size)
+        return 0;
+
+    memcpy(dst, path, len);
+    dst[len] = '\0';
+    return len;
+}
+
+static inline char *ionic_path_join(const char *parent, size_t parent_len, const char *filename, size_t filename_len)
+{
+    char *path = malloc(parent_len + filename_len + 1);
+    if (!path)
+        return NULL;
+
+    memcpy(path, parent, parent_len);
+    memcpy(path + parent_len, filename, filename_len);
+    path[parent_len + filename_len] = '\0';
+    return path;
+}
 
 
 static inline enum ionic_data_type ionic_safetensors_dtype_from_str(const char *dtype, const size_t size)
@@ -143,12 +172,15 @@ size_t ionic_safetensors_extract_registry(struct ionic_context *context, struct 
     size_t n = yyjson_obj_size(root);
     IONIC_INFO(&context->logger, IONIC_SAFETENSORS_EVENT_TAG, "discovery tensors=%zu", n);
 
-    registry->n = n;
-    registry->tensors = calloc(n, sizeof(ionic_tensor_t));
-    registry->names = calloc(n, sizeof(char *));
-    if(!registry->tensors || !registry->names) {
-        IONIC_ERROR(&context->logger, IONIC_SAFETENSORS_EVENT_TAG, "allocation_failed");
-        goto ko;
+    // in case of index file, we preallocate all the tensors and names arrays accross all the files
+    if (!registry->tensors || !registry->names) {
+        registry->n = n;
+        registry->tensors = calloc(n, sizeof(ionic_tensor_t));
+        registry->names = calloc(n, sizeof(char *));
+        if(!registry->tensors || !registry->names) {
+            IONIC_ERROR(&context->logger, IONIC_SAFETENSORS_EVENT_TAG, "allocation_failed");
+            goto ko;
+        }
     }
     
     size_t i = 0, max = 0, tidx = 0;
@@ -157,7 +189,7 @@ size_t ionic_safetensors_extract_registry(struct ionic_context *context, struct 
         const char *name = yyjson_get_str(key);
         const unsigned is_metadata = strcmp(name, "__metadata__") == 0;
 
-        if(!name) continue;
+        if(!name || is_metadata) continue;
         if (!yyjson_is_obj(val)) {
             context->error = IONIC_ERR(IONIC_ERROR_SAFETENSORS_JSON_MALFORMED_HEADER);
             goto ko;
@@ -172,17 +204,18 @@ size_t ionic_safetensors_extract_registry(struct ionic_context *context, struct 
 
         tensor->start += registry->hsize + sizeof(registry->hsize);
         tensor->end += registry->hsize + sizeof(registry->hsize);
-        registry->names[offset + tidx] = strndup(name, yyjson_get_len(val));
+        registry->names[offset + tidx] = strndup(name, yyjson_get_len(key));
         tidx++;
 
         IONIC_TRACE(
             &context->logger, IONIC_SAFETENSORS_EVENT_TAG, "\ttensor name=\"%s\" start=%zu end=%zu", name, tensor->start,  tensor->end);
     }
+    return tidx;
 ko:
     return 0;
 }
 
-size_t ionic_safetensors_discover_tensors_from_file(ionic_context_t *context, ionic_safetensors_t *registry, const char *const path) {
+size_t ionic_safetensors_discover_tensors_from_file(ionic_context_t *context, ionic_safetensors_t *registry, const char *const path, size_t offset) {
     IONIC_INFO(&context->logger, IONIC_SAFETENSORS_EVENT_TAG, "file path=\"%s\"", path);
     
     if(ionic_has_error(&context->error)) goto ko;
@@ -193,7 +226,7 @@ size_t ionic_safetensors_discover_tensors_from_file(ionic_context_t *context, io
         goto ko;
     }
 
-    char dst[64 * 1024];
+    char dst[128 * 1024];
     size_t n = context->backend->read(context, fd, (unsigned char *)dst, sizeof(dst), 0);
     
     if(n > 0) {
@@ -206,7 +239,6 @@ size_t ionic_safetensors_discover_tensors_from_file(ionic_context_t *context, io
                 IONIC_ERROR(&context->logger, IONIC_SAFETENSORS_EVENT_TAG, "file_read_failed path=\"%s\" errno=%d", path, errno);
                 goto ko;
             }
-            
 
             yyjson_val *root = yyjson_doc_get_root(doc);
             if(!root){
@@ -214,26 +246,89 @@ size_t ionic_safetensors_discover_tensors_from_file(ionic_context_t *context, io
                 goto ko;
             }
             
-            ionic_safetensors_extract_registry(context, registry, root, 0);
+            size_t count = ionic_safetensors_extract_registry(context, registry, root, offset);
             yyjson_doc_free(doc);
-            return n;
+            return count;
         }
     }
-
-
 ko:
     registry->hsize = 0;
     return 0;
 }
 
-size_t ionic_safetensors_discover_tensors_from_index(ionic_context_t *context, ionic_safetensors_t *registry, yyjson_doc *const doc) {
-    if(ionic_has_error(&context->error) || !doc) goto ko;
+size_t ionic_safetensors_discover_tensors_from_index(
+    ionic_context_t *context, ionic_safetensors_t *registry, yyjson_val *const root, const char *const workspace, size_t workspace_len) {
+    if(ionic_has_error(&context->error) || !root) goto ko;
     
-    size_t n = yyjson_doc_get_val_count(doc);
-    IONIC_INFO(&context->logger, IONIC_SAFETENSORS_EVENT_TAG, "discovery count=%zu", n);
-    return n;
+    yyjson_val *weights = yyjson_obj_get(root, "weight_map");
+    if(!weights) {
+        IONIC_ERROR(&context->logger, IONIC_SAFETENSORS_EVENT_TAG, "weight_map not found");
+        context->error = IONIC_ERR(IONIC_ERROR_SAFETENSORS_JSON_MALFORMED_HEADER);
+        goto ko;
+    }
+    
+    registry->n = yyjson_obj_size(weights);
+    IONIC_INFO(&context->logger, IONIC_SAFETENSORS_EVENT_TAG, "discovery count=%zu", registry->n);
+
+    if(registry->n <= 0) {
+        IONIC_ERROR(&context->logger, IONIC_SAFETENSORS_EVENT_TAG, "index weight_map=none");
+        context->error = IONIC_ERR(IONIC_ERROR_SAFETENSORS_JSON_MALFORMED_HEADER);
+        goto ko;
+    }
+
+    registry->tensors = calloc(registry->n, sizeof(ionic_tensor_t));
+    registry->names = calloc(registry->n, sizeof(char *));
+    if (!registry->tensors || !registry->names) goto freeup;
+
+    size_t n_files = 0;
+    char **files = calloc(registry->n, sizeof(char *));
+    if (!files) goto freeup;
+
+    size_t idx = 0, max = 0;
+    yyjson_val *key, *val;
+    yyjson_obj_foreach(weights, idx, max, key, val) {
+        const char *file = yyjson_get_str(val);
+        if (!file) continue;
+
+        size_t fi = 0;
+        for (; fi < n_files; fi++) {
+            if (strcmp(files[fi], file) == 0)
+                break;
+        }
+
+        if (fi == n_files)
+            files[n_files++] = strndup(file, yyjson_get_len(val));
+    }
+
+    IONIC_INFO(&context->logger, IONIC_SAFETENSORS_EVENT_TAG, "index files=%zu tensors=%zu", n_files, registry->n);
+
+    size_t offset = 0;
+    for (size_t fi = 0; fi < n_files; fi++) {
+        char *shard_path = ionic_path_join(workspace, workspace_len, files[fi], strlen(files[fi]));
+        if (!shard_path) goto freeup_files;
+
+        offset += ionic_safetensors_discover_tensors_from_file(context, registry, shard_path, offset);
+        free(shard_path);
+        free(files[fi]);
+
+        if (ionic_has_error(&context->error))
+            break;
+    }
+
+    free(files);
+    return offset;
+
+freeup_files:
+    for (size_t fi = 0; fi < n_files; fi++)
+        free(files[fi]);
+    free(files);
+
+freeup:
+    if(registry->tensors) free(registry->tensors);
+    if(registry->names) free(registry->names);
 
 ko:
+    registry->n = 0;
     return 0;
 }
 
@@ -244,10 +339,14 @@ size_t ionic_safetensors_discover_tensors(ionic_context_t *context, ionic_safete
     yyjson_doc *doc = yyjson_read_file(path, YYJSON_READ_NOFLAG, NULL, NULL);
     if(doc) {
         IONIC_INFO(&context->logger, IONIC_SAFETENSORS_EVENT_TAG, "index path=\"%s\"", path);
-        return ionic_safetensors_discover_tensors_from_index(context, registry, doc);
+
+        char workspace[1024];
+        size_t length = ionic_path_parent(path, workspace, sizeof(workspace));
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        return ionic_safetensors_discover_tensors_from_index(context, registry, root, workspace, length);
     }
     
-    return ionic_safetensors_discover_tensors_from_file(context, registry, path);
+    return ionic_safetensors_discover_tensors_from_file(context, registry, path, 0);
 
 free_doc:
     yyjson_doc_free(doc);
