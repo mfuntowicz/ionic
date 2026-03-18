@@ -20,11 +20,11 @@ struct ionic_logger {
 typedef struct ionic_logger ionic_logger_t;
 
 
-#define IONIC_LOG(logger, lvl, ...) ionic_log((logger), (lvl), __FILE__, __LINE__, __VA_ARGS__)
-#define IONIC_TRACE(logger, ...) IONIC_LOG((logger), IONIC_LOG_LEVEL_TRACE, __VA_ARGS__)
-#define IONIC_DEBUG(logger, ...) IONIC_LOG((logger), IONIC_LOG_LEVEL_DEBUG, __VA_ARGS__)
-#define IONIC_INFO(logger, ...)  IONIC_LOG((logger), IONIC_LOG_LEVEL_INFO,  __VA_ARGS__)
-#define IONIC_WARN(logger, ...)  IONIC_LOG((logger), IONIC_LOG_LEVEL_WARN,  __VA_ARGS__)
-#define IONIC_ERROR(logger, ...) IONIC_LOG((logger), IONIC_LOG_LEVEL_ERROR, __VA_ARGS__)
+#define IONIC_LOG(logger, lvl, tag, ...) ionic_log((logger), (lvl), (tag), __VA_ARGS__)
+#define IONIC_TRACE(logger, tag, ...) IONIC_LOG((logger), IONIC_LOG_LEVEL_TRACE, (tag), __VA_ARGS__)
+#define IONIC_DEBUG(logger, tag, ...) IONIC_LOG((logger), IONIC_LOG_LEVEL_DEBUG, (tag), __VA_ARGS__)
+#define IONIC_INFO(logger, tag, ...)  IONIC_LOG((logger), IONIC_LOG_LEVEL_INFO,  (tag), __VA_ARGS__)
+#define IONIC_WARN(logger, tag, ...)  IONIC_LOG((logger), IONIC_LOG_LEVEL_WARN,  (tag), __VA_ARGS__)
+#define IONIC_ERROR(logger, tag, ...) IONIC_LOG((logger), IONIC_LOG_LEVEL_ERROR, (tag), __VA_ARGS__)
 
 #endif // IONIC_LOGGING_H

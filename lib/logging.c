@@ -33,11 +33,11 @@ void ionic_logger_init(ionic_logger_t *logger) {
     logger->ready = 1;
 }
 
-void ionic_log(ionic_logger_t *logger, ionic_log_level_t level, const char *file, int line, const char *fmt, ...) {
+void ionic_log(ionic_logger_t *logger, ionic_log_level_t level, const char *tag, const char *fmt, ...) {
     if (!logger->ready) ionic_logger_init(logger);
-    if (level < logger->level) return;
+    if (level > logger->level) return;
 
-    fprintf(stderr, "[%s] %s:%d - ", LEVEL_NAMES[level], file, line);
+    fprintf(stderr, "[%-6s] [%-12s] ", LEVEL_NAMES[level], tag);
 
     va_list args;
     va_start(args, fmt);

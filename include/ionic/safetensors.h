@@ -11,6 +11,7 @@ extern "C" {
 struct ionic_safetensors {
     ionic_tensor_t *tensors;
     size_t n;
+    size_t hsize;
     char **names;
 };
 

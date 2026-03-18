@@ -4,6 +4,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#define IONIC_TOPOLOGY_EVENT_TAG "topology"
+
 /*
  * numa_all_cpus_ptr: CPUs the calling task may execute on
  * (from /proc/self/status Cpus_allowed). Respects cgroups/cpusets;
@@ -13,13 +15,13 @@
 /** Try to populate topology from NUMA. Returns 0 on success, -1 on fallback. */
 static int ionic_numa_probe(struct ionic_topology *topo, struct ionic_logger *log) {
     if (!numa_available()) {
-        IONIC_WARN(log, "NUMA not available on the platform, assuming single node topology");
+        IONIC_WARN(log, IONIC_TOPOLOGY_EVENT_TAG, "numa_not_available");
         return -1;
     }
 
     struct bitmask *allowed = numa_all_cpus_ptr;
     if (!allowed) {
-        IONIC_WARN(log, "numa_all_cpus_ptr not available, falling back to single node");
+        IONIC_WARN(log, IONIC_TOPOLOGY_EVENT_TAG, "numa_all_cpus_ptr not_available");
         return -1;
     }
 
@@ -31,6 +33,7 @@ static int ionic_numa_probe(struct ionic_topology *topo, struct ionic_logger *lo
     unsigned char *map = (unsigned char *)malloc((size_t)max_cpu);
     if (!map)
         return -1;
+    
     memset(map, IONIC_NODE_NONE, (size_t)max_cpu);
 
     struct bitmask *node_cpus = numa_allocate_cpumask();
@@ -66,12 +69,14 @@ void ionic_topology_init(struct ionic_context *ctx) {
     if (ionic_numa_probe(topology, &ctx->logger) != 0) {
         topology->num_cores = (unsigned short)sysconf(_SC_NPROCESSORS_ONLN);
         topology->num_nodes = 1;
+        topology->num_possible_cpus = topology->num_cores;
+        topology->node_of_core = calloc(topology->num_cores, sizeof(unsigned char));
     }
 
-    IONIC_INFO(&ctx->logger, "Topology nodes: %u, cores: %u", topology->num_nodes, topology->num_cores);
+    IONIC_INFO(&ctx->logger, IONIC_TOPOLOGY_EVENT_TAG, "topology nodes=%u, cores=%u", topology->num_nodes, topology->num_cores);
 }
 
 void ionic_topology_destroy(struct ionic_context *ctx) {
-    free(ctx->topology.node_of_core);
+    if(ctx->topology.node_of_core) free(ctx->topology.node_of_core);
     ctx->topology = (struct ionic_topology){0};
 }

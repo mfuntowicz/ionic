@@ -50,7 +50,7 @@ IONIC_INLINE unsigned ionic_version(void) NO_EXCEPT { return IONIC_VERSION; }
 
 #include "error.h"
 
-IONIC_EXTERN IONIC_INLINE unsigned char ionic_has_error(ionic_error_t *error) NO_EXCEPT { return error->kind != IONIC_ERROR_CODE_SUCCESS; }
+IONIC_EXTERN IONIC_INLINE unsigned char ionic_has_error(ionic_error_t *error) NO_EXCEPT { return error->kind != IONIC_ERROR_SUCCESS; }
 
 #include "logging.h"
 
@@ -59,16 +59,23 @@ IONIC_EXTERN IONIC_INLINE unsigned char ionic_has_error(ionic_error_t *error) NO
  * If the variable is absent or unrecognised the level defaults to OFF.
  */
 IONIC_EXTERN void ionic_logger_init(ionic_logger_t *) NO_EXCEPT;
-IONIC_EXTERN void ionic_log(ionic_logger_t *logger, ionic_log_level_t level, const char *file, int line, const char *fmt, ...) NO_EXCEPT;
+IONIC_EXTERN void ionic_log(ionic_logger_t *logger, ionic_log_level_t level, const char *tag, const char *fmt, ...) NO_EXCEPT;
 IONIC_EXTERN unsigned char ionic_log_level_is_enabled(ionic_logger_t *, ionic_log_level_t) NO_EXCEPT;
 
 #include "types.h"
 #include "topology.h"
 
+struct ionic_backend {
+    void (*destroy)(struct ionic_context *ctx);
+    size_t (*read)(struct ionic_context *ctx, int fd, unsigned char *dst, size_t len, size_t offset);
+};
+typedef struct ionic_backend ionic_backend_t;
+
 struct ionic_context {
     struct ionic_logger logger;
     struct ionic_error  error;
     struct ionic_topology topology;
+    struct ionic_backend *backend;
 };
 
 typedef struct ionic_context ionic_context_t;

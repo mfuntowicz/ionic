@@ -16,7 +16,11 @@ set(IONIC_SOURCES lib/context.c lib/memory.c lib/logging.c)
 set(IONIC_HEADERS include/ionic/ionic.h include/ionic/types.h include/ionic/logging.h include/ionic/topology.h)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(cmake/liburing.cmake)
     list(APPEND IONIC_SOURCES lib/platform/linux/topology.c)
+    list(APPEND IONIC_SOURCES lib/platform/linux/iouring.c)
+    list(APPEND IONIC_LIBS liburing_static)
+    add_compile_definitions(_GNU_SOURCE)
 endif()
 
 if(IONIC_ENABLE_CUDA)
