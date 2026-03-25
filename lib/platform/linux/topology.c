@@ -21,7 +21,7 @@ static int ionic_numa_probe(struct ionic_topology *topo, struct ionic_logger *lo
 
     struct bitmask *allowed = numa_all_cpus_ptr;
     if (!allowed) {
-        IONIC_WARN(log, IONIC_TOPOLOGY_EVENT_TAG, "numa_all_cpus_ptr not_available");
+        IONIC_WARN(log, IONIC_TOPOLOGY_EVENT_TAG, "numa_all_cpus_ptr not available");
         return -1;
     }
 

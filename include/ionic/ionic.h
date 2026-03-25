@@ -49,9 +49,6 @@ extern "C" {
 IONIC_INLINE unsigned ionic_version(void) NO_EXCEPT { return IONIC_VERSION; }
 
 #include "error.h"
-
-IONIC_EXTERN IONIC_INLINE unsigned char ionic_has_error(ionic_error_t *error) NO_EXCEPT { return error->kind != IONIC_ERROR_SUCCESS; }
-
 #include "logging.h"
 
 /*
@@ -59,29 +56,80 @@ IONIC_EXTERN IONIC_INLINE unsigned char ionic_has_error(ionic_error_t *error) NO
  * If the variable is absent or unrecognised the level defaults to OFF.
  */
 IONIC_EXTERN void ionic_logger_init(ionic_logger_t *) NO_EXCEPT;
-IONIC_EXTERN void ionic_log(ionic_logger_t *logger, ionic_log_level_t level, const char *tag, const char *fmt, ...) NO_EXCEPT;
+IONIC_EXTERN void ionic_log(ionic_logger_t *, ionic_log_level_t, const char *tag, const char *fmt, ...) NO_EXCEPT;
 IONIC_EXTERN unsigned char ionic_log_level_is_enabled(ionic_logger_t *, ionic_log_level_t) NO_EXCEPT;
 
 #include "types.h"
 #include "topology.h"
 
+static inline struct ionic_device ionic_cpu_device(unsigned char ordinal) NO_EXCEPT { return (struct ionic_device) { .kind = IONIC_DEVICE_CPU, .ordinal = ordinal }; }
+static inline struct ionic_device ionic_cuda_device(unsigned char ordinal) NO_EXCEPT { return (struct ionic_device) { .kind = IONIC_DEVICE_CUDA, .ordinal = ordinal }; } 
+
+IONIC_EXTERN void ionic_set_host_allocator(struct ionic_context *, struct ionic_allocator) NO_EXCEPT;
+IONIC_EXTERN void ionic_set_device_allocator(struct ionic_context *, struct ionic_allocator) NO_EXCEPT;
+IONIC_EXTERN void *ionic_allocate_host(struct ionic_context *, size_t, enum ionic_allocation_kind) NO_EXCEPT;
+IONIC_EXTERN void *ionic_allocate_device(struct ionic_context *, size_t, enum ionic_allocation_kind) NO_EXCEPT;
+IONIC_EXTERN void ionic_free_host(struct ionic_context *, void *, enum ionic_allocation_kind) NO_EXCEPT;
+IONIC_EXTERN void ionic_free_device(struct ionic_context *, void *, enum ionic_allocation_kind) NO_EXCEPT;
+
+IONIC_EXTERN void ionic_barrier_wait(struct ionic_barrier *) NO_EXCEPT;
+
 struct ionic_backend {
-    void (*destroy)(struct ionic_context *ctx);
-    size_t (*read)(struct ionic_context *ctx, int fd, unsigned char *dst, size_t len, size_t offset);
+    void (*destroy)(struct ionic_context *);
+    size_t (*read)(struct ionic_context *, int fd, unsigned char *dst, size_t len, size_t offset);
 };
 typedef struct ionic_backend ionic_backend_t;
 
+enum ionic_staging_slot_state {
+    IONIC_SLOT_EMPTY = 0,
+    IONIC_SLOT_FILLING,
+    IONIC_SLOT_FILLED,
+    IONIC_SLOT_COPYING,
+    IONIC_SLOT_SCATTERING,
+};
+
+#ifdef __IONIC_CUDA_ENABLED__
+#include <cuda_runtime.h>
+#include <stdatomic.h>
+
+struct ionic_staging_slot_cuda {
+    void *staging_ptr;
+    void *device_ptr;
+    cudaEvent_t h2d_done;
+    cudaEvent_t scatter_done;
+    atomic_uint state;
+    struct ionic_read_chunk *bound_chunk;
+    size_t submitted_chunk_index;
+};
+#endif
+
 struct ionic_context {
-    struct ionic_logger logger;
     struct ionic_error  error;
+    struct ionic_device device;
+    struct ionic_allocator halloc;
+    struct ionic_allocator dalloc;
+    struct ionic_logger logger;
     struct ionic_topology topology;
     struct ionic_backend *backend;
 };
 
 typedef struct ionic_context ionic_context_t;
 
-IONIC_EXTERN void ionic_context_init(ionic_context_t *) NO_EXCEPT;
-IONIC_EXTERN void ionic_context_destroy(ionic_context_t *) NO_EXCEPT;
+IONIC_EXTERN void ionic_allocator_init(struct ionic_context *, struct ionic_device) NO_EXCEPT;
+IONIC_EXTERN void ionic_context_init(struct ionic_context *, struct ionic_device) NO_EXCEPT;
+IONIC_EXTERN void ionic_context_destroy(struct ionic_context *) NO_EXCEPT;
+
+IONIC_EXTERN IONIC_INLINE void ionic_set_error(struct ionic_context *ctx, struct ionic_error error) NO_EXCEPT { ctx->error = error; };
+IONIC_EXTERN IONIC_INLINE unsigned char ionic_has_error(struct ionic_error *error) NO_EXCEPT { return error->kind != IONIC_ERROR_SUCCESS; }
+
+#include "planner.h"
+
+IONIC_EXTERN struct ionic_planner *ionic_planner_init(struct ionic_context *, size_t num_tensors, unsigned short rank, unsigned short world_size) NO_EXCEPT;
+IONIC_EXTERN void ionic_planner_destroy(struct ionic_planner *) NO_EXCEPT;
+IONIC_EXTERN void ionic_planner_register_sharding(struct ionic_context *, struct ionic_planner *, const struct ionic_tensor *, enum ionic_sharding_kind, int) NO_EXCEPT;
+IONIC_EXTERN void ionic_planner_execute_plan(struct ionic_context *, struct ionic_planner *, struct ionic_sharding_plan *) NO_EXCEPT;
+IONIC_EXTERN struct ionic_sharding_plan ionic_planner_materialize_plan(struct ionic_context *, struct ionic_planner *, int fd) NO_EXCEPT;
+IONIC_EXTERN void ionic_sharding_plan_destroy(struct ionic_context *, struct ionic_sharding_plan *) NO_EXCEPT;
 
 #ifdef __cplusplus
 }

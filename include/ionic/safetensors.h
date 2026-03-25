@@ -6,13 +6,14 @@ extern "C" {
 #endif
 
 #include <stddef.h>
-#include <ionic/ionic.h>
+#include "ionic/ionic.h"
 
 struct ionic_safetensors {
     ionic_tensor_t *tensors;
-    size_t n;
-    size_t hsize;
-    char **names;
+    size_t         n;
+    size_t         hsize;
+    int            *fds;   
+    char           **names;
 };
 
 typedef struct ionic_safetensors ionic_safetensors_t;
