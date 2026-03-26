@@ -2,7 +2,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdbool.h>
-
+#include <stdint.h>
 #include "ionic/ionic.h"
 #include "ionic/pipeline.h"
 #include "ionic/utils.h"
