@@ -439,9 +439,13 @@ int ionic_pipeline_execute_plan(struct ionic_context *ctx, struct ionic_pipeline
     
     struct ionic_backend *backend = ctx->backend;
     
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "execution starting backend=%p", (void*)backend);
+    
     /* Track chunk state: 0=pending, 1=io_done, 2=cuda_done */
     int *chunk_state = calloc(p->n_chunks, sizeof(*chunk_state));
     uint32_t *cuda_slots = calloc(p->n_chunks, sizeof(*cuda_slots));
+    
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "allocated chunk_state=%p cuda_slots=%p", (void*)chunk_state, (void*)cuda_slots);
     
     if (!chunk_state || !cuda_slots) {
         free(chunk_state);
@@ -510,16 +514,43 @@ int ionic_pipeline_execute_plan(struct ionic_context *ctx, struct ionic_pipeline
         
         for (size_t i = 0; i < n; i++) {
             size_t chunk_idx = (size_t)(uintptr_t)completions[i].userdata;
+            
+            /* Validate chunk_idx */
+            if (chunk_idx >= p->n_chunks) {
+                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "invalid chunk_idx=%zu", chunk_idx);
+                continue;
+            }
+            
             struct ionic_chunk_meta *c = &p->chunks[chunk_idx];
+            
+            /* Validate tensor_index */
+            if (c->tensor_index >= p->n_tensors) {
+                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "invalid tensor_index=%u", c->tensor_index);
+                continue;
+            }
+            
             struct ionic_tensor_status *ts = &p->statuses[c->tensor_index];
             uint32_t cuda_slot = cuda_slots[chunk_idx];
             
+            /* Validate cuda_slot */
+            if (cuda_slot >= p->config.staging_slot_count) {
+                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "invalid cuda_slot=%u", cuda_slot);
+                continue;
+            }
+            
             /* Copy from io_uring staging to CUDA staging */
-            memcpy(p->staging_buffers[cuda_slot], completions[i].staging_buffer, completions[i].bytes_read);
+            size_t copy_size = completions[i].bytes_read;
+            if (copy_size > c->payload_size)
+                copy_size = c->payload_size;
+            
+            memcpy(p->staging_buffers[cuda_slot], completions[i].staging_buffer, copy_size);
+            
+            /* Release the io_uring staging slot */
+            backend->release_staging(ctx, completions[i].staging_slot);
             
             /* Start H2D transfer */
             unsigned char *dst = (unsigned char *)ts->device_ptr + c->tensor_offset;
-            cudaError_t ce = cudaMemcpyAsync(dst, p->staging_buffers[cuda_slot], c->payload_size, 
+            cudaError_t ce = cudaMemcpyAsync(dst, p->staging_buffers[cuda_slot], copy_size, 
                                              cudaMemcpyHostToDevice, p->stream);
             if (ce != cudaSuccess) {
                 IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "cudaMemcpyAsync failed: %d", ce);

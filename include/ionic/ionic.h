@@ -99,9 +99,10 @@ IONIC_EXTERN size_t ionic_pipeline_get_bytes_loaded(const struct ionic_pipeline 
 
 /* I/O completion result */
 struct ionic_io_completion {
-    void *staging_buffer;   /* Pointer to staging buffer containing data */
-    size_t bytes_read;      /* Number of bytes read */
-    void *userdata;         /* User data passed to submit_read */
+    void   *staging_buffer;   /* Pointer to staging buffer containing data */
+    size_t   bytes_read;      /* Number of bytes read */
+    void    *userdata;        /* User data passed to submit_read */
+    size_t   staging_slot;    /* Slot index for release_staging() */
 };
 
 struct ionic_backend {

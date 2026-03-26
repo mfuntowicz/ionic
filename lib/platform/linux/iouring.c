@@ -116,9 +116,32 @@ struct ionic_iouring_flight {
     unsigned char *dst;
 };
 
-#define IONIC_IOURING_COOKIE_CHUNKED (1ULL << 63)
-#define IONIC_IOURING_COOKIE_ASYNC   (1ULL << 62)
+/*
+ * Completion cookie packed into sqe->user_data:
+ *
+ * For sync reads:
+ *   Bits 63-52: slot (12 bits, max 4095)
+ *   Bits 51-40: pad (12 bits, max 4095)
+ *   Bits 39-0:  length (40 bits)
+ *
+ * For async reads:
+ *   Bit 63:     always 0
+ *   Bit 62:     ASYNC flag (always 1 for async)
+ *   Bits 61-52: slot (10 bits, max 1023)
+ *   Bits 51-40: pad (12 bits)
+ *   Bits 39-0:  length (40 bits)
+ *
+ * For chunked reads (legacy):
+ *   Bit 63:     CHUNKED flag (always 1)
+ *   Bits 62-52: cuda_slot (11 bits)
+ *   Bits 51-40: pad (12 bits)
+ *   Bits 39-0:  length (40 bits)
+ */
 
+#define IONIC_IOURING_COOKIE_ASYNC   (1ULL << 62)
+#define IONIC_IOURING_COOKIE_CHUNKED (1ULL << 63)
+
+/* Pack cookie for sync reads (no flags) */
 static inline __u64 pack_cookie(unsigned slot, unsigned pad, size_t len)
 {
     return (((__u64)(slot & 0xFFF)) << 52) |
@@ -126,19 +149,25 @@ static inline __u64 pack_cookie(unsigned slot, unsigned pad, size_t len)
            ((__u64)(len & 0xFFFFFFFFFFULL));
 }
 
+/* Pack cookie for async reads - slot limited to 10 bits to avoid flag overlap */
 static inline __u64 pack_cookie_async(unsigned slot, unsigned pad, size_t len)
 {
-    return IONIC_IOURING_COOKIE_ASYNC | pack_cookie(slot, pad, len);
-}
-
-static inline __u64 pack_cookie_chunked(unsigned cuda_slot, unsigned pad, size_t len)
-{
-    return IONIC_IOURING_COOKIE_CHUNKED |
-           (((__u64)(cuda_slot & 0xFF)) << 52) |
+    return IONIC_IOURING_COOKIE_ASYNC |
+           (((__u64)(slot & 0x3FF)) << 52) |  /* 10 bits, max 1023 */
            (((__u64)(pad & 0xFFF)) << 40) |
            ((__u64)(len & 0xFFFFFFFFFFULL));
 }
 
+/* Pack cookie for chunked reads - cuda_slot limited to 11 bits */
+static inline __u64 pack_cookie_chunked(unsigned cuda_slot, unsigned pad, size_t len)
+{
+    return IONIC_IOURING_COOKIE_CHUNKED |
+           (((__u64)(cuda_slot & 0x7FF)) << 52) |  /* 11 bits, max 2047 */
+           (((__u64)(pad & 0xFFF)) << 40) |
+           ((__u64)(len & 0xFFFFFFFFFFULL));
+}
+
+/* Unpack cookie - works for all formats */
 static inline void unpack_cookie(__u64 cookie, unsigned *slot, unsigned *pad, size_t *len)
 {
     *slot = (unsigned)(cookie >> 52) & 0xFFF;
@@ -146,9 +175,22 @@ static inline void unpack_cookie(__u64 cookie, unsigned *slot, unsigned *pad, si
     *len  = (size_t)(cookie & 0xFFFFFFFFFFULL);
 }
 
+/* Unpack async cookie - masks out the ASYNC flag from slot */
+static inline void unpack_cookie_async(__u64 cookie, unsigned *slot, unsigned *pad, size_t *len)
+{
+    *slot = (unsigned)(cookie >> 52) & 0x3FF;  /* 10 bits, without ASYNC flag */
+    *pad  = (unsigned)(cookie >> 40) & 0xFFF;
+    *len  = (size_t)(cookie & 0xFFFFFFFFFFULL);
+}
+
 static inline bool cookie_is_async(__u64 cookie)
 {
     return (cookie & IONIC_IOURING_COOKIE_ASYNC) != 0;
+}
+
+static inline bool cookie_is_chunked(__u64 cookie)
+{
+    return (cookie & IONIC_IOURING_COOKIE_CHUNKED) != 0;
 }
 
 /* ── registered file descriptors (required for SQPOLL) ────────────── */
@@ -614,20 +656,26 @@ size_t ionic_iouring_poll_completions(struct ionic_context *ctx, struct ionic_io
 
         __u64 ud = cqe->user_data;
         bool is_async = cookie_is_async(ud);
+        bool is_chunked = cookie_is_chunked(ud);
         
         unsigned slot, pad;
         size_t len;
-        unpack_cookie(ud, &slot, &pad, &len);
+        
+        if (is_async) {
+            unpack_cookie_async(ud, &slot, &pad, &len);  /* Correct unpack for async */
+        } else {
+            unpack_cookie(ud, &slot, &pad, &len);         /* Sync read uses full 12-bit slot */
+        }
 
         io_uring_cqe_seen(be->ring, cqe);
         be->inflight--;
 
         if (cqe->res < 0) {
             IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOURING, 
-                        "async cqe error slot=%u res=%d", slot, cqe->res);
+                        "cqe error slot=%u res=%d is_async=%d", slot, cqe->res, is_async);
             if (is_async) {
                 struct ionic_async_op *op = (struct ionic_async_op *)be->flights[slot].dst;
-                free(op);
+                if (op) free(op);
                 arena_slot_set_free(&be->arena, slot);
             }
             continue;
@@ -635,6 +683,15 @@ size_t ionic_iouring_poll_completions(struct ionic_context *ctx, struct ionic_io
 
         if (is_async && completions) {
             struct ionic_async_op *op = (struct ionic_async_op *)be->flights[slot].dst;
+            
+            /* Validate that this is actually an async op (not a raw pointer from sync read) */
+            if (!op) {
+                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOURING, 
+                            "async completion has null op pointer slot=%u", slot);
+                arena_slot_set_free(&be->arena, slot);
+                continue;
+            }
+            
             unsigned char *buf = arena_slot_ptr(&be->arena, slot);
             
             size_t actual = (size_t)cqe->res > pad ? (size_t)cqe->res - pad : 0;
@@ -643,6 +700,7 @@ size_t ionic_iouring_poll_completions(struct ionic_context *ctx, struct ionic_io
             completions[completed].staging_buffer = buf + pad;
             completions[completed].bytes_read = to_deliver;
             completions[completed].userdata = op->userdata;
+            completions[completed].staging_slot = slot;
             
             free(op);
             /* Don't release slot - caller must do that via release_staging */
