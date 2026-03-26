@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 #include <liburing.h>
 #include "ionic/ionic.h"
@@ -19,6 +20,35 @@
 
 #define IONIC_IOURING_READ_ALIGNMENT 4096U
 #define IONIC_IOURING_SLOT_SIZE      512U * 1024U /* 512 kiB per slot */
+
+/* ── kernel version detection ───────────────────────────────────────── */
+
+static void ionic_iouring_get_kernel_version(unsigned *major, unsigned *minor)
+{
+    struct utsname uts;
+    *major = 0;
+    *minor = 0;
+
+    if (uname(&uts) == 0) {
+        sscanf(uts.release, "%u.%u", major, minor);
+    }
+}
+
+/* Sparse file registration requires kernel 5.19+ */
+#define IONIC_KERNEL_SPARSE_FILES_MIN_MAJOR 5
+#define IONIC_KERNEL_SPARSE_FILES_MIN_MINOR 19
+
+static inline bool ionic_iouring_kernel_supports_sparse_files(void)
+{
+    unsigned major, minor;
+    ionic_iouring_get_kernel_version(&major, &minor);
+
+    if (major > IONIC_KERNEL_SPARSE_FILES_MIN_MAJOR)
+        return 1;
+    if (major == IONIC_KERNEL_SPARSE_FILES_MIN_MAJOR && minor >= IONIC_KERNEL_SPARSE_FILES_MIN_MINOR)
+        return 1;
+    return 0;
+}
 
 /* ── slot bitmap helpers ──────────────────────────────────────────── */
 
@@ -137,6 +167,7 @@ struct ionic_backend_iouring {
     size_t                        depth;
     size_t                        inflight;
     bool                          use_fixed_buffers;
+    bool                          use_fixed_files;
 };
 
 typedef struct ionic_backend_iouring ionic_backend_iouring_t;
@@ -154,10 +185,15 @@ static inline size_t align_up(size_t v, size_t a)   { return (v + a - 1) & ~(a -
 /*
  * Look up an fd in the registered file table. If not yet registered,
  * register it now via io_uring_register_files_update.
- * Returns the fixed-file index or -1 on failure.
+ * Returns the fixed-file index, or the original fd if fixed files not available.
+ * Returns -1 on failure (only possible when fixed files are required but fail).
  */
 static int ionic_iouring_register_fd(struct ionic_context *ctx, struct ionic_backend_iouring *be, int fd)
 {
+    /* If sparse file table not registered, just use the regular fd */
+    if (!be->use_fixed_files)
+        return fd;
+
     struct ionic_fd_table *table = &be->fds;
 
     for (size_t i = 0; i < table->count; ++i) {
@@ -423,13 +459,14 @@ size_t ionic_iouring_read(struct ionic_context *ctx, int fd, unsigned char *dst,
             sqe = io_uring_get_sqe(be->ring);
         }
 
-        if (be->use_fixed_buffers) {
+        if (be->use_fixed_buffers)
             io_uring_prep_read_fixed(sqe, fixed_fd, arena_slot_ptr(&be->arena, slot), io_len, aligned_off, /*buf_index=*/0);
-            sqe->flags |= IOSQE_FIXED_FILE;
-        } else {
+        else
             io_uring_prep_read(sqe, fixed_fd, arena_slot_ptr(&be->arena, slot), io_len, aligned_off);
+        
+        if (be->use_fixed_files)
             sqe->flags |= IOSQE_FIXED_FILE;
-        }
+        
         sqe->user_data = pack_cookie((unsigned)slot, (unsigned)pad, chunk);
         be->inflight++;
         pending_submits++;
@@ -527,11 +564,26 @@ void ionic_iouring_init(struct ionic_context *ctx)
     if (ret < 0)
         IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOURING, "register_buffers_failed errno=%d (continuing without fixed buffers)", -ret);
 
-    /* Pre-register a sparse fd table so fds can be added at read time. */
+    /* Pre-register a file table for fixed file support.
+     * Sparse file registration requires kernel 5.19+.
+     * On older kernels, use non-fixed files (regular fd).
+     */
     ionic_fd_table_init(&be->fds);
-    ret = io_uring_register_files_sparse(be->ring, IONIC_IOURING_MAX_FDS);
-    if (ret < 0) {
-        IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOURING, "register_files_sparse_failed errno=%d (SQPOLL may not work)", -ret);
+
+    if (ionic_iouring_kernel_supports_sparse_files()) {
+        ret = io_uring_register_files_sparse(be->ring, IONIC_IOURING_MAX_FDS);
+        if (ret >= 0) {
+            be->use_fixed_files = true;
+            IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOURING, "sparse file table registered max=%d", IONIC_IOURING_MAX_FDS);
+        } else {
+            IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOURING, "sparse file registration failed errno=%d", -ret);
+            be->use_fixed_files = false;
+        }
+    } else {
+        unsigned kver_major, kver_minor;
+        ionic_iouring_get_kernel_version(&kver_major, &kver_minor);
+        IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOURING, "io_uring_register_files_sparse not available with kernel %u.%u (5.19+)", kver_major, kver_minor);
+        be->use_fixed_files = false;
     }
 
     be->flights = calloc(be->depth, sizeof(*be->flights));
@@ -549,10 +601,15 @@ void ionic_iouring_init(struct ionic_context *ctx)
     ctx->backend = &be->base;
 
     IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_IOURING,
-               "ready qd=%zu sq_thread_cpu=%u sq_thread_idle=%u arena=%zu slots=%zu chunk=%u fixed_bufs=%s",
+               "ready qd=%zu sq_thread_cpu=%u sq_thread_idle=%u arena=%zu slots=%zu chunk=%u fixed_bufs=%s fixed_files=%s",
                be->depth, params.sq_thread_cpu, params.sq_thread_idle,
                be->arena.length, be->arena.nslots, IONIC_IOURING_SLOT_SIZE,
-               be->use_fixed_buffers ? "yes" : "no");
+               be->use_fixed_buffers ? "yes" : "no",
+               be->use_fixed_files ? "yes" : "no");
+
+    unsigned kver_major, kver_minor;
+    ionic_iouring_get_kernel_version(&kver_major, &kver_minor);
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOURING, "kernel version=%u.%u", kver_major, kver_minor);
 }
 
 #ifdef __IONIC_CUDA_ENABLED__
