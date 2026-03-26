@@ -19,7 +19,7 @@
 #endif
 
 #define IONIC_IOURING_READ_ALIGNMENT 4096U
-#define IONIC_IOURING_SLOT_SIZE      512U * 1024U /* 512 kiB per slot */
+#define IONIC_IOURING_SLOT_SIZE      2U * 1024U * 1024U /* 512 kiB per slot */
 
 /* ── kernel version detection ───────────────────────────────────────── */
 
