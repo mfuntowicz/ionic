@@ -194,6 +194,19 @@ struct ionic_pipeline *ionic_pipeline_init(struct ionic_context *ctx, struct ion
                 ionic_set_error(ctx, IONIC_CUDA_ERR((int)ce));
                 return NULL;
             }
+            /* Record event immediately so cudaEventQuery returns cudaSuccess */
+            ce = cudaEventRecord(p->transfer_done[i], p->stream);
+            if (ce != cudaSuccess) {
+                for (uint32_t j = 0; j <= i; j++)
+                    cudaEventDestroy(p->transfer_done[j]);
+                cudaStreamDestroy(p->stream);
+                free(p->transfer_done);
+                free(p->staging_buffers);
+                free(p->slot_state);
+                free(p);
+                ionic_set_error(ctx, IONIC_CUDA_ERR((int)ce));
+                return NULL;
+            }
         }
         
         for (uint32_t i = 0; i < config.staging_slot_count; i++) {
