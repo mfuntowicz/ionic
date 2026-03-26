@@ -172,9 +172,21 @@ struct ionic_backend_iouring {
 
 typedef struct ionic_backend_iouring ionic_backend_iouring_t;
 
+/* Forward declarations for async I/O functions */
+int ionic_iouring_submit_read(struct ionic_context *ctx, int fd, size_t offset, size_t len, void *userdata);
+size_t ionic_iouring_poll_completions(struct ionic_context *ctx, struct ionic_io_completion *completions, size_t max_completions);
+size_t ionic_iouring_get_inflight(struct ionic_context *ctx);
+void *ionic_iouring_acquire_staging(struct ionic_context *ctx, size_t len, size_t *slot);
+void ionic_iouring_release_staging(struct ionic_context *ctx, size_t slot);
+
 static const struct ionic_backend ionic_iouring_vtable = {
-    .destroy = ionic_iouring_destroy,
-    .read    = ionic_iouring_read,
+    .destroy            = ionic_iouring_destroy,
+    .read               = ionic_iouring_read,
+    .submit_read        = ionic_iouring_submit_read,
+    .poll_completions   = ionic_iouring_poll_completions,
+    .get_inflight       = ionic_iouring_get_inflight,
+    .acquire_staging    = ionic_iouring_acquire_staging,
+    .release_staging    = ionic_iouring_release_staging,
 };
 
 /* ── helpers ──────────────────────────────────────────────────────── */
@@ -494,6 +506,167 @@ size_t ionic_iouring_read(struct ionic_context *ctx, int fd, unsigned char *dst,
     IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOURING, "read done fd=%d requested=%zu got=%zu", fd, len, read_bytes);
 
     return read_bytes;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Async I/O Operations
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* In-flight async operation tracking (stored in flights[slot].dst) */
+struct ionic_async_op {
+    void   *userdata;
+    size_t  slot;
+};
+
+int ionic_iouring_submit_read(struct ionic_context *ctx, int fd, size_t offset, size_t len, void *userdata)
+{
+    struct ionic_backend_iouring *be = (struct ionic_backend_iouring *)ctx->backend;
+    if (!be || !be->ring) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_BACKEND_INITIALIZATION_FAILED));
+        return -1;
+    }
+
+    int fixed_fd = ionic_iouring_register_fd(ctx, be, fd);
+    if (fixed_fd < 0 && be->use_fixed_files) {
+        ionic_set_error(ctx, IONIC_ERR_WITH_MSG(IONIC_ERROR_BACKEND_INITIALIZATION_FAILED, "failed to register fd"));
+        return -1;
+    }
+    if (fixed_fd < 0) fixed_fd = fd;
+
+    /* Compute aligned I/O parameters */
+    size_t aligned_off = align_down(offset, IONIC_IOURING_READ_ALIGNMENT);
+    size_t pad = offset - aligned_off;
+    size_t io_len = align_up(pad + len, IONIC_IOURING_READ_ALIGNMENT);
+
+    /* Acquire a staging slot */
+    size_t slot = arena_slot_acquire(&be->arena);
+    if (slot == (size_t)-1) {
+        IONIC_TRACE(&ctx->logger, IONIC_EVENT_TAG_IOURING, "no slots available for async read");
+        return -1;
+    }
+
+    /* Allocate tracking for this async op */
+    struct ionic_async_op *op = malloc(sizeof(*op));
+    if (!op) {
+        arena_slot_set_free(&be->arena, slot);
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+        return -1;
+    }
+    op->userdata = userdata;
+    op->slot = slot;
+
+    /* Get an SQE */
+    struct io_uring_sqe *sqe = io_uring_get_sqe(be->ring);
+    if (!sqe) {
+        arena_slot_set_free(&be->arena, slot);
+        free(op);
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOURING, "SQ ring full for async read");
+        return -1;
+    }
+
+    /* Prepare the read */
+    unsigned char *buf = arena_slot_ptr(&be->arena, slot);
+    if (be->use_fixed_buffers)
+        io_uring_prep_read_fixed(sqe, fixed_fd, buf, io_len, aligned_off, /*buf_index=*/0);
+    else
+        io_uring_prep_read(sqe, fixed_fd, buf, io_len, aligned_off);
+    
+    if (be->use_fixed_files)
+        sqe->flags |= IOSQE_FIXED_FILE;
+    
+    /* Pack: slot (12 bits) | pad (12 bits) | len (40 bits), with async flag */
+    sqe->user_data = (((__u64)(slot & 0xFFF)) << 52) |
+                     (((__u64)(pad & 0xFFF)) << 40) |
+                     ((__u64)(len & 0xFFFFFFFFFFULL)) |
+                     (1ULL << 63);  /* Async flag */
+    
+    /* Store the async op pointer in flights */
+    be->flights[slot].dst = (unsigned char *)op;
+    be->inflight++;
+
+    IONIC_TRACE(&ctx->logger, IONIC_EVENT_TAG_IOURING,
+                "async submit slot=%zu offset=%zu len=%zu io_len=%zu",
+                slot, offset, len, io_len);
+
+    return 0;
+}
+
+size_t ionic_iouring_poll_completions(struct ionic_context *ctx, struct ionic_io_completion *completions, size_t max_completions)
+{
+    struct ionic_backend_iouring *be = (struct ionic_backend_iouring *)ctx->backend;
+    if (!be || !be->ring) return 0;
+
+    struct io_uring_cqe *cqe;
+    size_t completed = 0;
+
+    for (size_t i = 0; i < max_completions; i++) {
+        if (io_uring_peek_cqe(be->ring, &cqe) != 0)
+            break;
+
+        __u64 ud = cqe->user_data;
+        bool is_async = (ud >> 63) & 1;
+        
+        unsigned slot = (unsigned)((ud >> 52) & 0xFFF);
+        unsigned pad = (unsigned)((ud >> 40) & 0xFFF);
+        size_t len = (size_t)(ud & 0xFFFFFFFFFFULL);
+
+        io_uring_cqe_seen(be->ring, cqe);
+        be->inflight--;
+
+        if (cqe->res < 0) {
+            IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOURING, 
+                        "async cqe error slot=%u res=%d", slot, cqe->res);
+            if (is_async) {
+                struct ionic_async_op *op = (struct ionic_async_op *)be->flights[slot].dst;
+                free(op);
+                arena_slot_set_free(&be->arena, slot);
+            }
+            continue;
+        }
+
+        if (is_async && completions) {
+            struct ionic_async_op *op = (struct ionic_async_op *)be->flights[slot].dst;
+            unsigned char *buf = arena_slot_ptr(&be->arena, slot);
+            
+            size_t actual = (size_t)cqe->res > pad ? (size_t)cqe->res - pad : 0;
+            size_t to_deliver = actual < len ? actual : len;
+            
+            completions[completed].staging_buffer = buf + pad;
+            completions[completed].bytes_read = to_deliver;
+            completions[completed].userdata = op->userdata;
+            
+            free(op);
+            /* Don't release slot - caller must do that via release_staging */
+            completed++;
+        }
+    }
+
+    return completed;
+}
+
+size_t ionic_iouring_get_inflight(struct ionic_context *ctx)
+{
+    struct ionic_backend_iouring *be = (struct ionic_backend_iouring *)ctx->backend;
+    return be ? be->inflight : 0;
+}
+
+void *ionic_iouring_acquire_staging(struct ionic_context *ctx, size_t len, size_t *slot_out)
+{
+    struct ionic_backend_iouring *be = (struct ionic_backend_iouring *)ctx->backend;
+    if (!be) return NULL;
+    
+    size_t slot = arena_slot_acquire(&be->arena);
+    if (slot == (size_t)-1) return NULL;
+    
+    if (slot_out) *slot_out = slot;
+    return arena_slot_ptr(&be->arena, slot);
+}
+
+void ionic_iouring_release_staging(struct ionic_context *ctx, size_t slot)
+{
+    struct ionic_backend_iouring *be = (struct ionic_backend_iouring *)ctx->backend;
+    if (!be) return;
+    arena_slot_set_free(&be->arena, slot);
 }
 
 /* ── public: destroy ──────────────────────────────────────────────── */

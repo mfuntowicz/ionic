@@ -426,92 +426,115 @@ int ionic_pipeline_execute_plan(struct ionic_context *ctx, struct ionic_pipeline
     
     struct ionic_backend *backend = ctx->backend;
     
-    size_t submitted = 0;
-    size_t completed = 0;
-    uint32_t inflight = 0;
+    /* Track chunk state: 0=pending, 1=io_done, 2=cuda_done */
+    int *chunk_state = calloc(p->n_chunks, sizeof(*chunk_state));
+    uint32_t *cuda_slots = calloc(p->n_chunks, sizeof(*cuda_slots));
     
-    struct slot_completion {
-        size_t chunk_idx;
-        size_t tensor_idx;
-        uint64_t tensor_offset;
-        uint32_t payload_size;
-    } *slot_info = calloc(p->config.staging_slot_count, sizeof(*slot_info));
-    
-    if (!slot_info) {
+    if (!chunk_state || !cuda_slots) {
+        free(chunk_state);
+        free(cuda_slots);
         ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
         return -1;
     }
     
+    /* Completion buffer for polling */
+    struct ionic_io_completion *completions = malloc(64 * sizeof(*completions));
+    if (!completions) {
+        free(chunk_state);
+        free(cuda_slots);
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+        return -1;
+    }
+    
+    size_t io_submitted = 0;
+    size_t completed = 0;
+    
     while (completed < p->n_chunks) {
-        while (submitted < p->n_chunks && inflight < p->config.max_inflight_reads) {
-            uint32_t slot = 0;
-            int found = 0;
+        /* Phase 1: Submit all pending I/O requests */
+        while (io_submitted < p->n_chunks) {
+            struct ionic_chunk_meta *c = &p->chunks[io_submitted];
+            struct ionic_tensor_status *ts = &p->statuses[c->tensor_index];
+            
+            /* Find a free CUDA slot for post-I/O processing */
+            uint32_t cuda_slot = UINT32_MAX;
             for (uint32_t s = 0; s < p->config.staging_slot_count; s++) {
                 uint32_t state = atomic_load_explicit(&p->slot_state[s], memory_order_acquire);
                 if (state == SLOT_FREE) {
                     cudaError_t q = cudaEventQuery(p->transfer_done[s]);
                     if (q == cudaSuccess) {
-                        slot = s;
-                        found = 1;
+                        cuda_slot = s;
                         break;
                     }
                 }
             }
             
-            if (!found)
+            if (cuda_slot == UINT32_MAX)
                 break;
             
-            struct ionic_chunk_meta *c = &p->chunks[submitted];
-            c->staging_slot = (uint16_t)slot;
-            
-            struct ionic_tensor_status *ts = &p->statuses[c->tensor_index];
-            
             atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_LOADING, memory_order_release);
+            atomic_store_explicit(&p->slot_state[cuda_slot], SLOT_READING, memory_order_release);
+            cuda_slots[io_submitted] = cuda_slot;
             
-            /* Read directly into staging buffer at offset 0.
-             * The backend handles file alignment internally. */
-            size_t read = backend->read(ctx, ts->fd, p->staging_buffers[slot], c->payload_size, c->file_offset + c->payload_offset);
-            
-            if (read != c->payload_size) {
-                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "read failed chunk=%zu requested=%u got=%zu", submitted, c->payload_size, read);
-                ts->error_code = -1;
+            /* Submit async read - pass chunk index as userdata */
+            int rc = backend->submit_read(ctx, ts->fd, c->file_offset + c->payload_offset, 
+                                          c->payload_size, (void *)(uintptr_t)io_submitted);
+            if (rc != 0) {
+                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "async submit failed chunk=%zu", io_submitted);
+                ts->error_code = rc;
                 atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_FAILED, memory_order_release);
-                free(slot_info);
+                atomic_store_explicit(&p->slot_state[cuda_slot], SLOT_FREE, memory_order_release);
+                free(chunk_state);
+                free(cuda_slots);
+                free(completions);
                 return -1;
             }
             
-            unsigned char *src = (unsigned char*)p->staging_buffers[slot];  /* Data read at offset 0 */
-            unsigned char *dst = (unsigned char*)ts->device_ptr + c->tensor_offset;
+            io_submitted++;
+        }
+        
+        /* Phase 2: Poll I/O completions and start CUDA transfers */
+        size_t n = backend->poll_completions(ctx, completions, 64);
+        
+        for (size_t i = 0; i < n; i++) {
+            size_t chunk_idx = (size_t)(uintptr_t)completions[i].userdata;
+            struct ionic_chunk_meta *c = &p->chunks[chunk_idx];
+            struct ionic_tensor_status *ts = &p->statuses[c->tensor_index];
+            uint32_t cuda_slot = cuda_slots[chunk_idx];
             
-            cudaError_t ce = cudaMemcpyAsync(dst, src, c->payload_size, cudaMemcpyHostToDevice, p->stream);
+            /* Copy from io_uring staging to CUDA staging */
+            memcpy(p->staging_buffers[cuda_slot], completions[i].staging_buffer, completions[i].bytes_read);
+            
+            /* Start H2D transfer */
+            unsigned char *dst = (unsigned char *)ts->device_ptr + c->tensor_offset;
+            cudaError_t ce = cudaMemcpyAsync(dst, p->staging_buffers[cuda_slot], c->payload_size, 
+                                             cudaMemcpyHostToDevice, p->stream);
             if (ce != cudaSuccess) {
-                ionic_set_error(ctx, IONIC_CUDA_ERR((int)ce));
+                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "cudaMemcpyAsync failed: %d", ce);
                 ts->error_code = (int)ce;
                 atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_FAILED, memory_order_release);
-                free(slot_info);
+                free(chunk_state);
+                free(cuda_slots);
+                free(completions);
+                return -1;
+            }
+            
+            ce = cudaEventRecord(p->transfer_done[cuda_slot], p->stream);
+            if (ce != cudaSuccess) {
+                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "cudaEventRecord failed: %d", ce);
+                ts->error_code = (int)ce;
+                atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_FAILED, memory_order_release);
+                free(chunk_state);
+                free(cuda_slots);
+                free(completions);
                 return -1;
             }
             
             atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_TRANSFERRING, memory_order_release);
-            
-            ce = cudaEventRecord(p->transfer_done[slot], p->stream);
-            if (ce != cudaSuccess) {
-                ionic_set_error(ctx, IONIC_CUDA_ERR((int)ce));
-                free(slot_info);
-                return -1;
-            }
-            
-            atomic_store_explicit(&p->slot_state[slot], SLOT_TRANSFERRING, memory_order_release);
-            
-            slot_info[slot].chunk_idx = submitted;
-            slot_info[slot].tensor_idx = c->tensor_index;
-            slot_info[slot].tensor_offset = c->tensor_offset;
-            slot_info[slot].payload_size = c->payload_size;
-            
-            submitted++;
-            inflight++;
+            atomic_store_explicit(&p->slot_state[cuda_slot], SLOT_TRANSFERRING, memory_order_release);
+            chunk_state[chunk_idx] = 1;  /* I/O done */
         }
         
+        /* Phase 3: Poll CUDA transfer completions */
         for (uint32_t slot = 0; slot < p->config.staging_slot_count; slot++) {
             uint32_t state = atomic_load_explicit(&p->slot_state[slot], memory_order_acquire);
             if (state != SLOT_TRANSFERRING)
@@ -523,25 +546,32 @@ int ionic_pipeline_execute_plan(struct ionic_context *ctx, struct ionic_pipeline
             
             if (q != cudaSuccess) {
                 ionic_set_error(ctx, IONIC_CUDA_ERR((int)q));
-                free(slot_info);
+                free(chunk_state);
+                free(cuda_slots);
+                free(completions);
                 return -1;
             }
             
-            size_t tensor_idx = slot_info[slot].tensor_idx;
-            uint32_t payload = slot_info[slot].payload_size;
-            
-            struct ionic_tensor_status *ts = &p->statuses[tensor_idx];
-            uint64_t loaded = atomic_fetch_add_explicit(&ts->bytes_loaded, payload, memory_order_relaxed) + payload;
-            
-            atomic_fetch_add_explicit(&p->loaded_bytes, payload, memory_order_relaxed);
-            
-            if (loaded >= ts->size) {
-                atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_READY, memory_order_release);
+            /* Find which chunk this slot belongs to */
+            for (size_t i = 0; i < p->n_chunks; i++) {
+                if (cuda_slots[i] == slot && chunk_state[i] == 1) {
+                    chunk_state[i] = 2;  /* CUDA done */
+                    completed++;
+                    
+                    struct ionic_chunk_meta *c = &p->chunks[i];
+                    struct ionic_tensor_status *ts = &p->statuses[c->tensor_index];
+                    
+                    uint64_t loaded = atomic_fetch_add_explicit(&ts->bytes_loaded, c->payload_size, memory_order_relaxed) + c->payload_size;
+                    atomic_fetch_add_explicit(&p->loaded_bytes, c->payload_size, memory_order_relaxed);
+                    
+                    if (loaded >= ts->size) {
+                        atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_READY, memory_order_release);
+                    }
+                    break;
+                }
             }
             
             atomic_store_explicit(&p->slot_state[slot], SLOT_FREE, memory_order_release);
-            inflight--;
-            completed++;
         }
         
         if (completed < p->n_chunks)
@@ -551,11 +581,15 @@ int ionic_pipeline_execute_plan(struct ionic_context *ctx, struct ionic_pipeline
     cudaError_t ce = cudaStreamSynchronize(p->stream);
     if (ce != cudaSuccess) {
         ionic_set_error(ctx, IONIC_CUDA_ERR((int)ce));
-        free(slot_info);
+        free(chunk_state);
+        free(cuda_slots);
+        free(completions);
         return -1;
     }
     
-    free(slot_info);
+    free(chunk_state);
+    free(cuda_slots);
+    free(completions);
     
     IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_PIPELINE,
                "completed tensors=%zu chunks=%zu bytes=%llu",

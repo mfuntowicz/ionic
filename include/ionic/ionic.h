@@ -97,9 +97,25 @@ IONIC_EXTERN size_t ionic_pipeline_get_bytes_loaded(const struct ionic_pipeline 
  * Backend Interface
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* I/O completion result */
+struct ionic_io_completion {
+    void *staging_buffer;   /* Pointer to staging buffer containing data */
+    size_t bytes_read;      /* Number of bytes read */
+    void *userdata;         /* User data passed to submit_read */
+};
+
 struct ionic_backend {
     void (*destroy)(struct ionic_context *);
+    
+    /* Synchronous read (legacy) */
     size_t (*read)(struct ionic_context *, int fd, unsigned char *dst, size_t len, size_t offset);
+    
+    /* Async I/O operations */
+    int (*submit_read)(struct ionic_context *, int fd, size_t offset, size_t len, void *userdata);
+    size_t (*poll_completions)(struct ionic_context *, struct ionic_io_completion *completions, size_t max_completions);
+    size_t (*get_inflight)(struct ionic_context *);
+    void *(*acquire_staging)(struct ionic_context *, size_t len, size_t *slot);
+    void (*release_staging)(struct ionic_context *, size_t slot);
 };
 typedef struct ionic_backend ionic_backend_t;
 
