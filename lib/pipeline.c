@@ -347,12 +347,16 @@ static int ionic_pipeline_build_chunks(struct ionic_context *ctx, struct ionic_p
     }
     
     /*
-     * Compute total byte range needed across all tensors.
-     * Find min_offset and max_end_offset to determine file range.
+     * Strategy: Build fixed-size chunks based on tensor coverage.
+     * Only create chunks that actually overlap with at least one tensor.
+     * 
+     * Each chunk is STAGING_BUFFER_SIZE, starting from the first tensor's aligned offset.
      */
+    int32_t primary_fd = p->statuses[0].fd;  /* Assume single file for now */
+    
+    /* Find the starting point (aligned offset of first tensor) */
     uint64_t min_offset = UINT64_MAX;
     uint64_t max_end_offset = 0;
-    int32_t primary_fd = p->statuses[0].fd;  /* Assume single file for now */
     
     for (size_t i = 0; i < p->n_tensors; i++) {
         if (p->statuses[i].offset < min_offset)
@@ -362,18 +366,39 @@ static int ionic_pipeline_build_chunks(struct ionic_context *ctx, struct ionic_p
             max_end_offset = end;
     }
     
-    /* Align the start offset down for direct I/O */
     uint64_t aligned_start = ionic_align_down_sz(min_offset, alignment);
-    uint64_t total_range = max_end_offset - aligned_start;
     
-    /* Count chunks: divide total range into fixed-size I/O chunks */
-    size_t total_chunks = (total_range + chunk_io_size - 1) / chunk_io_size;
-    if (total_chunks == 0) total_chunks = 1;
+    /* First pass: count chunks that actually overlap with tensors */
+    size_t total_chunks = 0;
+    uint64_t chunk_start = aligned_start;
+    
+    while (chunk_start < max_end_offset) {
+        uint64_t chunk_end = chunk_start + chunk_io_size;
+        if (chunk_end > max_end_offset + alignment)  /* Allow slight overshoot for last chunk */
+            chunk_end = max_end_offset + alignment;
+        
+        /* Check if this chunk overlaps with any tensor */
+        bool has_overlap = false;
+        for (size_t t = 0; t < p->n_tensors; t++) {
+            uint64_t tensor_start = p->statuses[t].offset;
+            uint64_t tensor_end = tensor_start + p->statuses[t].size;
+            
+            if (tensor_start < chunk_end && tensor_end > chunk_start) {
+                has_overlap = true;
+                break;
+            }
+        }
+        
+        if (has_overlap)
+            total_chunks++;
+        
+        chunk_start = chunk_end;
+    }
     
     IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_PIPELINE,
-                "planning range: tensors=%zu range=%llu-%llu aligned_start=%llu total_range=%llu chunks=%zu",
+                "planning range: tensors=%zu range=%llu-%llu aligned_start=%llu chunks=%zu",
                 p->n_tensors, (unsigned long long)min_offset, (unsigned long long)max_end_offset,
-                (unsigned long long)aligned_start, (unsigned long long)total_range, total_chunks);
+                (unsigned long long)aligned_start, total_chunks);
     
     p->chunks = calloc(total_chunks, sizeof(struct ionic_chunk_meta));
     if (!p->chunks) {
@@ -382,27 +407,43 @@ static int ionic_pipeline_build_chunks(struct ionic_context *ctx, struct ionic_p
     }
     p->n_chunks = total_chunks;
     
-    /* Build fixed-size chunks */
-    size_t tensor_idx = 0;  /* Current tensor we're processing */
+    /* Second pass: build chunks that overlap with tensors */
+    size_t chunk_idx = 0;
+    chunk_start = aligned_start;
     
-    for (size_t chunk_idx = 0; chunk_idx < total_chunks; chunk_idx++) {
-        struct ionic_chunk_meta *c = &p->chunks[chunk_idx];
-        
-        uint64_t chunk_start = aligned_start + (chunk_idx * chunk_io_size);
+    while (chunk_start < max_end_offset && chunk_idx < total_chunks) {
         uint64_t chunk_end = chunk_start + chunk_io_size;
-        if (chunk_end > max_end_offset)
-            chunk_end = max_end_offset;
+        if (chunk_end > max_end_offset + alignment)
+            chunk_end = max_end_offset + alignment;
+        
+        /* Check if this chunk overlaps with any tensor */
+        bool has_overlap = false;
+        for (size_t t = 0; t < p->n_tensors; t++) {
+            uint64_t tensor_start = p->statuses[t].offset;
+            uint64_t tensor_end = tensor_start + p->statuses[t].size;
+            
+            if (tensor_start < chunk_end && tensor_end > chunk_start) {
+                has_overlap = true;
+                break;
+            }
+        }
+        
+        if (!has_overlap) {
+            chunk_start = chunk_end;
+            continue;
+        }
+        
+        struct ionic_chunk_meta *c = &p->chunks[chunk_idx];
         
         /* Align the I/O start down and size up for direct I/O */
         uint64_t aligned_off = ionic_align_down_sz(chunk_start, alignment);
         uint32_t pad = (uint32_t)(chunk_start - aligned_off);
         uint32_t payload = (uint32_t)(chunk_end - chunk_start);
         
-        /* For the last chunk, ensure we don't read past file end */
         uint64_t io_end = ionic_align_up_sz(chunk_end, alignment);
         uint32_t io_size = (uint32_t)(io_end - aligned_off);
-        if (io_size > chunk_io_size)
-            io_size = (uint32_t)chunk_io_size;
+        if (io_size > chunk_io_size + (uint32_t)alignment)
+            io_size = (uint32_t)(chunk_io_size + alignment);
         
         c->file_offset = aligned_off;
         c->io_size = io_size;
@@ -415,47 +456,28 @@ static int ionic_pipeline_build_chunks(struct ionic_context *ctx, struct ionic_p
         c->flags = 0;
         
         /* Resolve which tensors this chunk covers */
-        for (size_t t = tensor_idx; t < p->n_tensors; t++) {
+        for (size_t t = 0; t < p->n_tensors; t++) {
             struct ionic_tensor_status *ts = &p->statuses[t];
             uint64_t tensor_start = ts->offset;
             uint64_t tensor_end = tensor_start + ts->size;
             
-            /* Skip tensors that are entirely before this chunk */
-            if (tensor_end <= chunk_start) {
-                tensor_idx = t + 1;
-                continue;
-            }
-            
-            /* Stop if tensor is entirely after this chunk */
-            if (tensor_start >= chunk_end)
-                break;
-            
-            /* This tensor overlaps with the chunk */
-            if (c->first_tensor < 0)
-                c->first_tensor = (int32_t)t;
-            c->last_tensor = (int32_t)t;
-        }
-    }
-    
-    /* Debug: verify tensor coverage */
-    size_t uncovered = 0;
-    for (size_t t = 0; t < p->n_tensors; t++) {
-        bool found = false;
-        for (size_t c = 0; c < p->n_chunks; c++) {
-            if (p->chunks[c].first_tensor <= (int32_t)t && 
-                p->chunks[c].last_tensor >= (int32_t)t) {
-                found = true;
-                break;
+            if (tensor_start < chunk_end && tensor_end > chunk_start) {
+                /* This tensor overlaps with the chunk */
+                if (c->first_tensor < 0)
+                    c->first_tensor = (int32_t)t;
+                c->last_tensor = (int32_t)t;
             }
         }
-        if (!found) uncovered++;
+        
+        chunk_idx++;
+        chunk_start = chunk_end;
     }
     
     IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_PIPELINE,
-                "built chunks tensors=%zu chunks=%zu total_bytes=%llu io_size=%zuKB uncovered=%zu",
+                "built chunks tensors=%zu chunks=%zu total_bytes=%llu io_size=%zuKB",
                 p->n_tensors, p->n_chunks, 
                 (unsigned long long)atomic_load(&p->total_bytes),
-                chunk_io_size / 1024, uncovered);
+                chunk_io_size / 1024);
     
     return 0;
 }
