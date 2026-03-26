@@ -7,7 +7,7 @@
 #include "ionic/pipeline.h"
 #include "ionic/utils.h"
 
-#define IONIC_PIPELINE_TAG "pipeline"
+#define IONIC_EVENT_TAG_PIPELINE "pipeline"
 
 /*
  * Read Chunk Metadata (internal)
@@ -75,7 +75,7 @@ size_t ionic_tensor_status_get_bytes_loaded(const struct ionic_tensor_status *s)
 
 size_t ionic_tensor_status_get_total_bytes(const struct ionic_tensor_status *s)
 {
-    return (size_t)s->total_bytes;
+    return (size_t)s->size;
 }
 
 bool ionic_tensor_status_is_complete(const struct ionic_tensor_status *s)
@@ -216,7 +216,7 @@ struct ionic_pipeline *ionic_pipeline_init(struct ionic_context *ctx, struct ion
     }
 #endif
     
-    IONIC_INFO(&ctx->logger, IONIC_PIPELINE_TAG,
+    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_PIPELINE,
                "initialized slots=%u slot_size=%llu batch=%u max_inflight=%u",
                config.staging_slot_count, 
                (unsigned long long)config.staging_buffer_size,
@@ -288,30 +288,58 @@ static int ionic_pipeline_init_from_plan(
         atomic_store_explicit(&s->state, IONIC_TENSOR_STATE_PENDING, memory_order_release);
         atomic_store_explicit(&s->bytes_loaded, 0, memory_order_release);
         
-        s->total_bytes   = spec->end - spec->start;
-        s->start_offset  = spec->start;
-        s->device_ptr    = spec->dst;
-        s->fd            = st->fd;
-        s->error_code    = 0;
+        s->size = spec->end - spec->start;
+        s->offset = spec->start;
+        s->fd = st->fd;
+        s->error_code = 0;
         
-        atomic_fetch_add_explicit(&p->total_bytes, s->total_bytes, memory_order_relaxed);
+        /* Allocate device memory if not provided */
+        if (spec->dst) {
+            s->device_ptr = spec->dst;
+        } else {
+            s->device_ptr = ionic_allocate_device(ctx, s->size, IONIC_ALLOC_DEVICE);
+            if (!s->device_ptr) {
+                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "device memory allocation failed tensor=%zu size=%zu", i, s->size);
+                for (size_t j = 0; j < i; j++) {
+                    if (p->statuses[j].device_ptr && !plan->tensors[j].specs[rank].dst) {
+                        ionic_free_device(ctx, p->statuses[j].device_ptr, IONIC_ALLOC_DEVICE);
+                    }
+                }
+                free(p->statuses);
+                p->statuses = NULL;
+                return -1;
+            }
+            /* Update plan so caller can access the pointer */
+            spec->dst = s->device_ptr;
+        }
+        
+        atomic_fetch_add_explicit(&p->total_bytes, s->size, memory_order_relaxed);
     }
     
     return 0;
 }
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Chunk Planning
- * ═══════════════════════════════════════════════════════════════════════════ */
 
 static int ionic_pipeline_build_chunks(struct ionic_context *ctx, struct ionic_pipeline *p)
 {
     const size_t alignment = 4096;
     size_t total_chunks = 0;
     
+    // account for alignment
     for (size_t i = 0; i < p->n_tensors; i++) {
-        size_t remaining = p->statuses[i].total_bytes;
-        total_chunks += (remaining + p->config.staging_buffer_size - 1) / p->config.staging_buffer_size;
+        size_t remaining = p->statuses[i].size;
+        size_t file_offset = p->statuses[i].offset;
+        
+        while (remaining > 0) {
+            size_t aligned_off = ionic_align_down_sz(file_offset, alignment);
+            size_t pad = file_offset - aligned_off;
+            size_t payload = remaining;
+            if (payload + pad > p->config.staging_buffer_size)
+                payload = p->config.staging_buffer_size - pad;
+            
+            total_chunks++;
+            file_offset += payload;
+            remaining -= payload;
+        }
     }
     
     p->chunks = calloc(total_chunks, sizeof(struct ionic_chunk_meta));
@@ -325,9 +353,9 @@ static int ionic_pipeline_build_chunks(struct ionic_context *ctx, struct ionic_p
     for (size_t tensor_idx = 0; tensor_idx < p->n_tensors; tensor_idx++) {
         struct ionic_tensor_status *s = &p->statuses[tensor_idx];
         
-        uint64_t tensor_offset = 0;
-        uint64_t file_offset = s->start_offset;
-        size_t remaining = s->total_bytes;
+        size_t tensor_offset = 0;
+        size_t file_offset = s->offset;
+        size_t remaining = s->size;
         
         while (remaining > 0) {
             struct ionic_chunk_meta *c = &p->chunks[chunk_idx];
@@ -361,7 +389,7 @@ static int ionic_pipeline_build_chunks(struct ionic_context *ctx, struct ionic_p
         }
     }
     
-    IONIC_DEBUG(&ctx->logger, IONIC_PIPELINE_TAG,
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_PIPELINE,
                 "built chunks tensors=%zu chunks=%zu total_bytes=%llu",
                 p->n_tensors, p->n_chunks, 
                 (unsigned long long)atomic_load(&p->total_bytes));
@@ -375,19 +403,16 @@ static int ionic_pipeline_build_chunks(struct ionic_context *ctx, struct ionic_p
 
 #ifdef __IONIC_CUDA_ENABLED__
 
-int ionic_pipeline_execute_plan(
-    struct ionic_context *ctx,
-    struct ionic_pipeline *p,
-    struct ionic_sharding_plan *plan,
-    unsigned short rank)
-{
+int ionic_pipeline_execute_plan(struct ionic_context *ctx, struct ionic_pipeline *p, struct ionic_sharding_plan *plan, unsigned short rank) {
+    if(ionic_has_error(&ctx->error)) return -1; 
+
     if (!p || !plan || plan->n == 0) {
-        IONIC_ERROR(&ctx->logger, IONIC_PIPELINE_TAG, "invalid plan");
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "invalid plan");
         return -1;
     }
     
-    free(p->statuses);
-    free(p->chunks);
+    if(p->statuses) free(p->statuses);
+    if(p->chunks)   free(p->chunks);
     p->statuses = NULL;
     p->chunks = NULL;
     p->n_tensors = 0;
@@ -443,27 +468,22 @@ int ionic_pipeline_execute_plan(
             
             atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_LOADING, memory_order_release);
             
-            size_t read = backend->read(ctx, 
-                                        ts->fd,
-                                        (unsigned char*)p->staging_buffers[slot] + c->payload_offset,
-                                        c->payload_size,
-                                        c->file_offset + c->payload_offset);
+            /* Read directly into staging buffer at offset 0.
+             * The backend handles file alignment internally. */
+            size_t read = backend->read(ctx, ts->fd, p->staging_buffers[slot], c->payload_size, c->file_offset + c->payload_offset);
             
             if (read != c->payload_size) {
-                IONIC_ERROR(&ctx->logger, IONIC_PIPELINE_TAG,
-                           "read failed chunk=%zu requested=%u got=%zu",
-                           submitted, c->payload_size, read);
+                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "read failed chunk=%zu requested=%u got=%zu", submitted, c->payload_size, read);
                 ts->error_code = -1;
                 atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_FAILED, memory_order_release);
                 free(slot_info);
                 return -1;
             }
             
-            unsigned char *src = (unsigned char*)p->staging_buffers[slot] + c->payload_offset;
+            unsigned char *src = (unsigned char*)p->staging_buffers[slot];  /* Data read at offset 0 */
             unsigned char *dst = (unsigned char*)ts->device_ptr + c->tensor_offset;
             
-            cudaError_t ce = cudaMemcpyAsync(dst, src, c->payload_size,
-                                             cudaMemcpyHostToDevice, p->stream);
+            cudaError_t ce = cudaMemcpyAsync(dst, src, c->payload_size, cudaMemcpyHostToDevice, p->stream);
             if (ce != cudaSuccess) {
                 ionic_set_error(ctx, IONIC_CUDA_ERR((int)ce));
                 ts->error_code = (int)ce;
@@ -515,7 +535,7 @@ int ionic_pipeline_execute_plan(
             
             atomic_fetch_add_explicit(&p->loaded_bytes, payload, memory_order_relaxed);
             
-            if (loaded >= ts->total_bytes) {
+            if (loaded >= ts->size) {
                 atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_READY, memory_order_release);
             }
             
@@ -537,7 +557,7 @@ int ionic_pipeline_execute_plan(
     
     free(slot_info);
     
-    IONIC_INFO(&ctx->logger, IONIC_PIPELINE_TAG,
+    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_PIPELINE,
                "completed tensors=%zu chunks=%zu bytes=%llu",
                p->n_tensors, p->n_chunks, 
                (unsigned long long)atomic_load(&p->loaded_bytes));

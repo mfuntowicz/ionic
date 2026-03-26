@@ -1,3 +1,4 @@
+#include "ionic/pipeline.h"
 #include <errno.h>
 #include <stdio.h>
 #include <ionic/ionic.h>
@@ -56,7 +57,8 @@ int main(int argc, char **argv)
     }
 
     struct ionic_sharding_plan plan = ionic_planner_materialize_plan(&ctx, planner, 0);
-    ionic_planner_execute_plan(&ctx, planner, &plan);
+    struct ionic_pipeline *pipeline = ionic_pipeline_init(&ctx, ionic_pipeline_config_default(ctx.device));
+    int num_tensors = ionic_pipeline_execute_plan(&ctx, pipeline, &plan, planner->rank);
 
     ionic_planner_destroy(planner);
     ionic_safetensors_destroy(&registry);
