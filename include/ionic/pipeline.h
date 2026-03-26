@@ -63,10 +63,10 @@ struct ionic_pipeline_config {
 
 static inline struct ionic_pipeline_config ionic_pipeline_config_default(struct ionic_device device) {
     return (struct ionic_pipeline_config) {
-        .staging_buffer_size = 512 * 1024UL,
-        .staging_slot_count  = 8,
-        .io_uring_batch_size = 32,
-        .max_inflight_reads  = 64
+        .staging_buffer_size = 512 * 1024UL,   /* 512 KiB per slot */
+        .staging_slot_count  = 64,              /* More parallel H2D */
+        .io_uring_batch_size = 128,             /* Larger batch submits */
+        .max_inflight_reads  = 256               /* Match io_uring depth */
     };
 }
 

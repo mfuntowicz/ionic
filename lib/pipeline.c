@@ -11,22 +11,25 @@
 
 /*
  * Read Chunk Metadata (internal)
+ * 
+ * Design: Fixed-size I/O chunks (STAGING_BUFFER_SIZE) driven by file ranges,
+ * not tensor boundaries. A single chunk may span multiple tensors.
+ * During completion, we resolve which tensors each chunk covers.
  */
 struct ionic_chunk_meta {
-    uint64_t file_offset;
-    uint32_t io_size;
-    uint32_t payload_offset;
-    uint32_t payload_size;
-    uint32_t tensor_index;
-    uint64_t tensor_offset;
-    uint16_t staging_slot;
+    uint64_t file_offset;      /* Aligned start offset in file */
+    uint32_t io_size;          /* Actual I/O size (aligned) */
+    uint32_t payload_offset;   /* Offset of valid data within I/O (alignment padding) */
+    uint32_t payload_size;     /* Valid data size */
+    int32_t  fd;               /* File descriptor for this chunk */
+    int32_t  first_tensor;     /* First tensor index this chunk covers */
+    int32_t  last_tensor;      /* Last tensor index this chunk covers (inclusive) */
+    uint16_t staging_slot;     /* Assigned staging slot during execution */
     uint16_t flags;
-    uint32_t _pad;
 };
 
 enum ionic_chunk_flag {
-    IONIC_CHUNK_FLAG_FIRST = 1 << 0,
-    IONIC_CHUNK_FLAG_LAST  = 1 << 1,
+    IONIC_CHUNK_FLAG_NONE = 0,
 };
 
 /*
@@ -335,25 +338,42 @@ static int ionic_pipeline_init_from_plan(
 static int ionic_pipeline_build_chunks(struct ionic_context *ctx, struct ionic_pipeline *p)
 {
     const size_t alignment = 4096;
-    size_t total_chunks = 0;
+    const size_t chunk_io_size = p->config.staging_buffer_size;  /* Fixed I/O size for all chunks */
     
-    // account for alignment
-    for (size_t i = 0; i < p->n_tensors; i++) {
-        size_t remaining = p->statuses[i].size;
-        size_t file_offset = p->statuses[i].offset;
-        
-        while (remaining > 0) {
-            size_t aligned_off = ionic_align_down_sz(file_offset, alignment);
-            size_t pad = file_offset - aligned_off;
-            size_t payload = remaining;
-            if (payload + pad > p->config.staging_buffer_size)
-                payload = p->config.staging_buffer_size - pad;
-            
-            total_chunks++;
-            file_offset += payload;
-            remaining -= payload;
-        }
+    if (p->n_tensors == 0) {
+        p->chunks = NULL;
+        p->n_chunks = 0;
+        return 0;
     }
+    
+    /*
+     * Compute total byte range needed across all tensors.
+     * Find min_offset and max_end_offset to determine file range.
+     */
+    uint64_t min_offset = UINT64_MAX;
+    uint64_t max_end_offset = 0;
+    int32_t primary_fd = p->statuses[0].fd;  /* Assume single file for now */
+    
+    for (size_t i = 0; i < p->n_tensors; i++) {
+        if (p->statuses[i].offset < min_offset)
+            min_offset = p->statuses[i].offset;
+        uint64_t end = p->statuses[i].offset + p->statuses[i].size;
+        if (end > max_end_offset)
+            max_end_offset = end;
+    }
+    
+    /* Align the start offset down for direct I/O */
+    uint64_t aligned_start = ionic_align_down_sz(min_offset, alignment);
+    uint64_t total_range = max_end_offset - aligned_start;
+    
+    /* Count chunks: divide total range into fixed-size I/O chunks */
+    size_t total_chunks = (total_range + chunk_io_size - 1) / chunk_io_size;
+    if (total_chunks == 0) total_chunks = 1;
+    
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_PIPELINE,
+                "planning range: tensors=%zu range=%llu-%llu aligned_start=%llu total_range=%llu chunks=%zu",
+                p->n_tensors, (unsigned long long)min_offset, (unsigned long long)max_end_offset,
+                (unsigned long long)aligned_start, (unsigned long long)total_range, total_chunks);
     
     p->chunks = calloc(total_chunks, sizeof(struct ionic_chunk_meta));
     if (!p->chunks) {
@@ -362,50 +382,80 @@ static int ionic_pipeline_build_chunks(struct ionic_context *ctx, struct ionic_p
     }
     p->n_chunks = total_chunks;
     
-    size_t chunk_idx = 0;
-    for (size_t tensor_idx = 0; tensor_idx < p->n_tensors; tensor_idx++) {
-        struct ionic_tensor_status *s = &p->statuses[tensor_idx];
+    /* Build fixed-size chunks */
+    size_t tensor_idx = 0;  /* Current tensor we're processing */
+    
+    for (size_t chunk_idx = 0; chunk_idx < total_chunks; chunk_idx++) {
+        struct ionic_chunk_meta *c = &p->chunks[chunk_idx];
         
-        size_t tensor_offset = 0;
-        size_t file_offset = s->offset;
-        size_t remaining = s->size;
+        uint64_t chunk_start = aligned_start + (chunk_idx * chunk_io_size);
+        uint64_t chunk_end = chunk_start + chunk_io_size;
+        if (chunk_end > max_end_offset)
+            chunk_end = max_end_offset;
         
-        while (remaining > 0) {
-            struct ionic_chunk_meta *c = &p->chunks[chunk_idx];
+        /* Align the I/O start down and size up for direct I/O */
+        uint64_t aligned_off = ionic_align_down_sz(chunk_start, alignment);
+        uint32_t pad = (uint32_t)(chunk_start - aligned_off);
+        uint32_t payload = (uint32_t)(chunk_end - chunk_start);
+        
+        /* For the last chunk, ensure we don't read past file end */
+        uint64_t io_end = ionic_align_up_sz(chunk_end, alignment);
+        uint32_t io_size = (uint32_t)(io_end - aligned_off);
+        if (io_size > chunk_io_size)
+            io_size = (uint32_t)chunk_io_size;
+        
+        c->file_offset = aligned_off;
+        c->io_size = io_size;
+        c->payload_offset = pad;
+        c->payload_size = payload;
+        c->fd = primary_fd;
+        c->first_tensor = -1;
+        c->last_tensor = -1;
+        c->staging_slot = 0;
+        c->flags = 0;
+        
+        /* Resolve which tensors this chunk covers */
+        for (size_t t = tensor_idx; t < p->n_tensors; t++) {
+            struct ionic_tensor_status *ts = &p->statuses[t];
+            uint64_t tensor_start = ts->offset;
+            uint64_t tensor_end = tensor_start + ts->size;
             
-            size_t aligned_off = ionic_align_down_sz(file_offset, alignment);
-            size_t pad = file_offset - aligned_off;
-            size_t payload = remaining;
-            if (payload + pad > p->config.staging_buffer_size)
-                payload = p->config.staging_buffer_size - pad;
+            /* Skip tensors that are entirely before this chunk */
+            if (tensor_end <= chunk_start) {
+                tensor_idx = t + 1;
+                continue;
+            }
             
-            size_t io_size = ionic_align_up_sz(pad + payload, alignment);
+            /* Stop if tensor is entirely after this chunk */
+            if (tensor_start >= chunk_end)
+                break;
             
-            c->file_offset    = aligned_off;
-            c->io_size        = (uint32_t)io_size;
-            c->payload_offset = (uint32_t)pad;
-            c->payload_size   = (uint32_t)payload;
-            c->tensor_index   = (uint32_t)tensor_idx;
-            c->tensor_offset  = tensor_offset;
-            c->staging_slot   = 0;
-            c->flags          = 0;
-            
-            if (tensor_offset == 0)
-                c->flags |= IONIC_CHUNK_FLAG_FIRST;
-            if (remaining == payload)
-                c->flags |= IONIC_CHUNK_FLAG_LAST;
-            
-            file_offset += payload;
-            tensor_offset += payload;
-            remaining -= payload;
-            chunk_idx++;
+            /* This tensor overlaps with the chunk */
+            if (c->first_tensor < 0)
+                c->first_tensor = (int32_t)t;
+            c->last_tensor = (int32_t)t;
         }
     }
     
+    /* Debug: verify tensor coverage */
+    size_t uncovered = 0;
+    for (size_t t = 0; t < p->n_tensors; t++) {
+        bool found = false;
+        for (size_t c = 0; c < p->n_chunks; c++) {
+            if (p->chunks[c].first_tensor <= (int32_t)t && 
+                p->chunks[c].last_tensor >= (int32_t)t) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) uncovered++;
+    }
+    
     IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_PIPELINE,
-                "built chunks tensors=%zu chunks=%zu total_bytes=%llu",
+                "built chunks tensors=%zu chunks=%zu total_bytes=%llu io_size=%zuKB uncovered=%zu",
                 p->n_tensors, p->n_chunks, 
-                (unsigned long long)atomic_load(&p->total_bytes));
+                (unsigned long long)atomic_load(&p->total_bytes),
+                chunk_io_size / 1024, uncovered);
     
     return 0;
 }
@@ -473,17 +523,29 @@ int ionic_pipeline_execute_plan(struct ionic_context *ctx, struct ionic_pipeline
         /* Phase 1: Submit I/O requests aggressively (decoupled from CUDA slots) */
         while (io_submitted < p->n_chunks && io_inflight < p->config.max_inflight_reads) {
             struct ionic_chunk_meta *c = &p->chunks[io_submitted];
-            struct ionic_tensor_status *ts = &p->statuses[c->tensor_index];
             
-            atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_LOADING, memory_order_release);
+            /* Mark all covered tensors as loading */
+            if (c->first_tensor >= 0) {
+                for (int32_t t = c->first_tensor; t <= c->last_tensor; t++) {
+                    atomic_store_explicit(&p->statuses[t].state, IONIC_TENSOR_STATE_LOADING, memory_order_release);
+                }
+            }
             
-            /* Submit async read - pass chunk index as userdata */
-            int rc = backend->submit_read(ctx, ts->fd, c->file_offset + c->payload_offset, 
-                                          c->payload_size, (void *)(uintptr_t)io_submitted);
+            /* Submit async read for the full chunk - pass chunk index as userdata */
+            int rc = backend->submit_read(ctx, c->fd, c->file_offset, 
+                                          c->io_size, (void *)(uintptr_t)io_submitted);
+            IONIC_TRACE(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, 
+                       "submit chunk=%zu io_size=%u io_off=%llu", 
+                       io_submitted, c->io_size, (unsigned long long)c->file_offset);
             if (rc != 0) {
                 IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "async submit failed chunk=%zu", io_submitted);
-                ts->error_code = rc;
-                atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_FAILED, memory_order_release);
+                /* Mark all covered tensors as failed */
+                if (c->first_tensor >= 0) {
+                    for (int32_t t = c->first_tensor; t <= c->last_tensor; t++) {
+                        p->statuses[t].error_code = rc;
+                        atomic_store_explicit(&p->statuses[t].state, IONIC_TENSOR_STATE_FAILED, memory_order_release);
+                    }
+                }
                 free(chunk_state);
                 free(cuda_slots);
                 free(completions);
@@ -512,15 +574,13 @@ int ionic_pipeline_execute_plan(struct ionic_context *ctx, struct ionic_pipeline
             
             struct ionic_chunk_meta *c = &p->chunks[chunk_idx];
             
-            /* Validate tensor_index */
-            if (c->tensor_index >= p->n_tensors) {
-                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "invalid tensor_index=%u", c->tensor_index);
+            /* Skip chunks with no tensors (shouldn't happen but safety check) */
+            if (c->first_tensor < 0 || c->first_tensor >= (int32_t)p->n_tensors) {
+                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "chunk has no valid tensors chunk=%zu", chunk_idx);
                 backend->release_staging(ctx, completions[i].staging_slot);
-                completed++;  /* Count as complete (failed) */
+                completed++;
                 continue;
             }
-            
-            struct ionic_tensor_status *ts = &p->statuses[c->tensor_index];
             
             /* Find a free CUDA slot for H2D transfer */
             uint32_t cuda_slot = UINT32_MAX;
@@ -550,13 +610,29 @@ int ionic_pipeline_execute_plan(struct ionic_context *ctx, struct ionic_pipeline
                                         completed++;
                                         
                                         struct ionic_chunk_meta *cc = &p->chunks[ci];
-                                        struct ionic_tensor_status *tsc = &p->statuses[cc->tensor_index];
                                         
-                                        uint64_t loaded = atomic_fetch_add_explicit(&tsc->bytes_loaded, cc->payload_size, memory_order_relaxed) + cc->payload_size;
-                                        atomic_fetch_add_explicit(&p->loaded_bytes, cc->payload_size, memory_order_relaxed);
-                                        
-                                        if (loaded >= tsc->size) {
-                                            atomic_store_explicit(&tsc->state, IONIC_TENSOR_STATE_READY, memory_order_release);
+                                        /* Update all tensors covered by this chunk */
+                                        for (int32_t t = cc->first_tensor; t <= cc->last_tensor && t < (int32_t)p->n_tensors; t++) {
+                                            struct ionic_tensor_status *tsc = &p->statuses[t];
+                                            
+                                            /* Calculate overlap between chunk and tensor */
+                                            uint64_t chunk_start = cc->file_offset + cc->payload_offset;
+                                            uint64_t chunk_end = chunk_start + cc->payload_size;
+                                            uint64_t tensor_start = tsc->offset;
+                                            uint64_t tensor_end = tensor_start + tsc->size;
+                                            
+                                            uint64_t overlap_start = (chunk_start > tensor_start) ? chunk_start : tensor_start;
+                                            uint64_t overlap_end = (chunk_end < tensor_end) ? chunk_end : tensor_end;
+                                            
+                                            if (overlap_start < overlap_end) {
+                                                uint64_t overlap_bytes = overlap_end - overlap_start;
+                                                uint64_t loaded = atomic_fetch_add_explicit(&tsc->bytes_loaded, overlap_bytes, memory_order_relaxed) + overlap_bytes;
+                                                atomic_fetch_add_explicit(&p->loaded_bytes, overlap_bytes, memory_order_relaxed);
+                                                
+                                                if (loaded >= tsc->size) {
+                                                    atomic_store_explicit(&tsc->state, IONIC_TENSOR_STATE_READY, memory_order_release);
+                                                }
+                                            }
                                         }
                                         break;
                                     }
@@ -599,41 +675,75 @@ int ionic_pipeline_execute_plan(struct ionic_context *ctx, struct ionic_pipeline
             atomic_store_explicit(&p->slot_state[cuda_slot], SLOT_READING, memory_order_release);
             
             /* Copy from io_uring staging to CUDA staging */
-            size_t copy_size = completions[i].bytes_read;
-            if (copy_size > c->payload_size)
-                copy_size = c->payload_size;
-            
-            memcpy(p->staging_buffers[cuda_slot], completions[i].staging_buffer, copy_size);
+            memcpy(p->staging_buffers[cuda_slot], completions[i].staging_buffer, c->payload_size);
             
             /* Release the io_uring staging slot */
             backend->release_staging(ctx, completions[i].staging_slot);
             
-            /* Start H2D transfer */
-            unsigned char *dst = (unsigned char *)ts->device_ptr + c->tensor_offset;
-            cudaError_t ce = cudaMemcpyAsync(dst, p->staging_buffers[cuda_slot], copy_size, 
-                                             cudaMemcpyHostToDevice, p->stream);
-            if (ce != cudaSuccess) {
-                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "cudaMemcpyAsync failed: %d", ce);
-                ts->error_code = (int)ce;
-                atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_FAILED, memory_order_release);
+            /* Calculate chunk's data range (where valid data starts and ends in the staging buffer) */
+            uint64_t chunk_data_start = c->file_offset + c->payload_offset;
+            uint64_t chunk_data_end = chunk_data_start + c->payload_size;
+            
+            /* Issue H2D transfers for each tensor covered by this chunk */
+            bool any_transfer_failed = false;
+            for (int32_t t = c->first_tensor; t <= c->last_tensor && t < (int32_t)p->n_tensors; t++) {
+                struct ionic_tensor_status *ts = &p->statuses[t];
+                
+                /* Calculate overlap between chunk and tensor */
+                uint64_t tensor_start = ts->offset;
+                uint64_t tensor_end = tensor_start + ts->size;
+                
+                uint64_t overlap_start = (chunk_data_start > tensor_start) ? chunk_data_start : tensor_start;
+                uint64_t overlap_end = (chunk_data_end < tensor_end) ? chunk_data_end : tensor_end;
+                
+                if (overlap_start >= overlap_end)
+                    continue;  /* No overlap (shouldn't happen but safety) */
+                
+                uint64_t overlap_bytes = overlap_end - overlap_start;
+                
+                /* Calculate source offset in staging buffer */
+                size_t src_offset = (size_t)(overlap_start - chunk_data_start);
+                
+                /* Calculate destination offset in tensor's device memory */
+                size_t dst_offset = (size_t)(overlap_start - tensor_start);
+                
+                unsigned char *dst = (unsigned char *)ts->device_ptr + dst_offset;
+                unsigned char *src = (unsigned char *)p->staging_buffers[cuda_slot] + src_offset;
+                
+                cudaError_t ce = cudaMemcpyAsync(dst, src, overlap_bytes, 
+                                                 cudaMemcpyHostToDevice, p->stream);
+                if (ce != cudaSuccess) {
+                    IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "cudaMemcpyAsync failed: %d", ce);
+                    ts->error_code = (int)ce;
+                    atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_FAILED, memory_order_release);
+                    any_transfer_failed = true;
+                    break;
+                }
+                
+                /* Mark tensor as transferring */
+                ionic_tensor_state_t current = atomic_load_explicit(&ts->state, memory_order_acquire);
+                if (current != IONIC_TENSOR_STATE_FAILED) {
+                    atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_TRANSFERRING, memory_order_release);
+                }
+            }
+            
+            if (any_transfer_failed) {
                 free(chunk_state);
                 free(cuda_slots);
                 free(completions);
                 return -1;
             }
             
-            ce = cudaEventRecord(p->transfer_done[cuda_slot], p->stream);
+            /* Record completion event for the whole set of transfers */
+            cudaError_t ce = cudaEventRecord(p->transfer_done[cuda_slot], p->stream);
             if (ce != cudaSuccess) {
                 IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "cudaEventRecord failed: %d", ce);
-                ts->error_code = (int)ce;
-                atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_FAILED, memory_order_release);
                 free(chunk_state);
                 free(cuda_slots);
                 free(completions);
                 return -1;
             }
             
-            atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_TRANSFERRING, memory_order_release);
             atomic_store_explicit(&p->slot_state[cuda_slot], SLOT_TRANSFERRING, memory_order_release);
             chunk_state[chunk_idx] = 1;  /* I/O done */
         }
@@ -663,13 +773,31 @@ int ionic_pipeline_execute_plan(struct ionic_context *ctx, struct ionic_pipeline
                     completed++;
                     
                     struct ionic_chunk_meta *c = &p->chunks[i];
-                    struct ionic_tensor_status *ts = &p->statuses[c->tensor_index];
                     
-                    uint64_t loaded = atomic_fetch_add_explicit(&ts->bytes_loaded, c->payload_size, memory_order_relaxed) + c->payload_size;
-                    atomic_fetch_add_explicit(&p->loaded_bytes, c->payload_size, memory_order_relaxed);
+                    /* Calculate chunk's data range */
+                    uint64_t chunk_data_start = c->file_offset + c->payload_offset;
+                    uint64_t chunk_data_end = chunk_data_start + c->payload_size;
                     
-                    if (loaded >= ts->size) {
-                        atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_READY, memory_order_release);
+                    /* Update all tensors covered by this chunk */
+                    for (int32_t t = c->first_tensor; t <= c->last_tensor && t < (int32_t)p->n_tensors; t++) {
+                        struct ionic_tensor_status *ts = &p->statuses[t];
+                        
+                        /* Calculate overlap between chunk and tensor */
+                        uint64_t tensor_start = ts->offset;
+                        uint64_t tensor_end = tensor_start + ts->size;
+                        
+                        uint64_t overlap_start = (chunk_data_start > tensor_start) ? chunk_data_start : tensor_start;
+                        uint64_t overlap_end = (chunk_data_end < tensor_end) ? chunk_data_end : tensor_end;
+                        
+                        if (overlap_start < overlap_end) {
+                            uint64_t overlap_bytes = overlap_end - overlap_start;
+                            uint64_t loaded = atomic_fetch_add_explicit(&ts->bytes_loaded, overlap_bytes, memory_order_relaxed) + overlap_bytes;
+                            atomic_fetch_add_explicit(&p->loaded_bytes, overlap_bytes, memory_order_relaxed);
+                            
+                            if (loaded >= ts->size) {
+                                atomic_store_explicit(&ts->state, IONIC_TENSOR_STATE_READY, memory_order_release);
+                            }
+                        }
                     }
                     break;
                 }
