@@ -4,7 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define IONIC_TOPOLOGY_EVENT_TAG "topology"
+#define IONIC_EVENT_TAG_TOPOLOGY "topology"
 
 /*
  * numa_all_cpus_ptr: CPUs the calling task may execute on
@@ -15,13 +15,13 @@
 /** Try to populate topology from NUMA. Returns 0 on success, -1 on fallback. */
 static int ionic_numa_probe(struct ionic_topology *topo, struct ionic_logger *log) {
     if (!numa_available()) {
-        IONIC_WARN(log, IONIC_TOPOLOGY_EVENT_TAG, "numa_not_available");
+        IONIC_WARN(log, IONIC_EVENT_TAG_TOPOLOGY, "numa_not_available");
         return -1;
     }
 
     struct bitmask *allowed = numa_all_cpus_ptr;
     if (!allowed) {
-        IONIC_WARN(log, IONIC_TOPOLOGY_EVENT_TAG, "numa_all_cpus_ptr not available");
+        IONIC_WARN(log, IONIC_EVENT_TAG_TOPOLOGY, "numa_all_cpus_ptr not available");
         return -1;
     }
 
@@ -73,7 +73,7 @@ void ionic_topology_init(struct ionic_context *ctx) {
         topology->node_of_core = calloc(topology->num_cores, sizeof(unsigned char));
     }
 
-    IONIC_INFO(&ctx->logger, IONIC_TOPOLOGY_EVENT_TAG, "topology nodes=%u, cores=%u", topology->num_nodes, topology->num_cores);
+    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_TOPOLOGY, "topology nodes=%u, cores=%u", topology->num_nodes, topology->num_cores);
 }
 
 void ionic_topology_destroy(struct ionic_context *ctx) {
