@@ -117,12 +117,18 @@ struct ionic_iouring_flight {
 };
 
 #define IONIC_IOURING_COOKIE_CHUNKED (1ULL << 63)
+#define IONIC_IOURING_COOKIE_ASYNC   (1ULL << 62)
 
 static inline __u64 pack_cookie(unsigned slot, unsigned pad, size_t len)
 {
     return (((__u64)(slot & 0xFFF)) << 52) |
            (((__u64)(pad  & 0xFFF)) << 40) |
            ((__u64)(len & 0xFFFFFFFFFFULL));
+}
+
+static inline __u64 pack_cookie_async(unsigned slot, unsigned pad, size_t len)
+{
+    return IONIC_IOURING_COOKIE_ASYNC | pack_cookie(slot, pad, len);
 }
 
 static inline __u64 pack_cookie_chunked(unsigned cuda_slot, unsigned pad, size_t len)
@@ -138,6 +144,11 @@ static inline void unpack_cookie(__u64 cookie, unsigned *slot, unsigned *pad, si
     *slot = (unsigned)(cookie >> 52) & 0xFFF;
     *pad  = (unsigned)(cookie >> 40) & 0xFFF;
     *len  = (size_t)(cookie & 0xFFFFFFFFFFULL);
+}
+
+static inline bool cookie_is_async(__u64 cookie)
+{
+    return (cookie & IONIC_IOURING_COOKIE_ASYNC) != 0;
 }
 
 /* ── registered file descriptors (required for SQPOLL) ────────────── */
@@ -574,15 +585,13 @@ int ionic_iouring_submit_read(struct ionic_context *ctx, int fd, size_t offset, 
     if (be->use_fixed_files)
         sqe->flags |= IOSQE_FIXED_FILE;
     
-    /* Pack: slot (12 bits) | pad (12 bits) | len (40 bits), with async flag */
-    sqe->user_data = (((__u64)(slot & 0xFFF)) << 52) |
-                     (((__u64)(pad & 0xFFF)) << 40) |
-                     ((__u64)(len & 0xFFFFFFFFFFULL)) |
-                     (1ULL << 63);  /* Async flag */
+    /* Pack cookie with async flag */
+    sqe->user_data = pack_cookie_async(slot, pad, len);
     
-    /* Store the async op pointer in flights */
     be->flights[slot].dst = (unsigned char *)op;
     be->inflight++;
+
+    io_uring_submit(be->ring);
 
     IONIC_TRACE(&ctx->logger, IONIC_EVENT_TAG_IOURING,
                 "async submit slot=%zu offset=%zu len=%zu io_len=%zu",
@@ -604,11 +613,11 @@ size_t ionic_iouring_poll_completions(struct ionic_context *ctx, struct ionic_io
             break;
 
         __u64 ud = cqe->user_data;
-        bool is_async = (ud >> 63) & 1;
+        bool is_async = cookie_is_async(ud);
         
-        unsigned slot = (unsigned)((ud >> 52) & 0xFFF);
-        unsigned pad = (unsigned)((ud >> 40) & 0xFFF);
-        size_t len = (size_t)(ud & 0xFFFFFFFFFFULL);
+        unsigned slot, pad;
+        size_t len;
+        unpack_cookie(ud, &slot, &pad, &len);
 
         io_uring_cqe_seen(be->ring, cqe);
         be->inflight--;
