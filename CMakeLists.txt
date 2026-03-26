@@ -14,8 +14,21 @@ option(IONIC_ENABLE_CUDA "Enable CUDA support" OFF)
 option(IONIC_ENABLE_SAFETENSORS "Enable Safetensors support" OFF)
 
 set(IONIC_LIBS "NUMA::numa")
-set(IONIC_SOURCES lib/context.c lib/memory.c lib/logging.c lib/planner.c)
-set(IONIC_HEADERS include/ionic/ionic.h include/ionic/types.h include/ionic/read_plan.h include/ionic/error.h include/ionic/logging.h include/ionic/topology.h include/ionic/planner.h)
+set(IONIC_SOURCES
+    lib/context.c
+    lib/memory.c
+    lib/logging.c
+    lib/planner.c
+    lib/pipeline.c
+)
+set(IONIC_HEADERS 
+    include/ionic/ionic.h 
+    include/ionic/types.h
+    include/ionic/error.h
+    include/ionic/logging.h
+    include/ionic/topology.h
+    include/ionic/planner.h
+)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     include(cmake/liburing.cmake)
