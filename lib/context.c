@@ -17,7 +17,7 @@ void *ionic_malloc_cpu_allocate(struct ionic_context *ctx, size_t size, enum ion
 void ionic_malloc_cpu_free(struct ionic_context *ctx, void *ptr, enum ionic_allocation_kind kind);
 #endif
 
-#define IONIC_CONTEXT_EVENT_TAG "context"
+#define IONIC_EVENT_TAG_CONTEXT "context"
 
 void ionic_allocator_init(struct ionic_context *ctx, struct ionic_device device) {
 #if defined(__linux__)
@@ -55,7 +55,7 @@ void ionic_context_init(struct ionic_context *ctx, struct ionic_device device) {
 #ifdef __IONIC_CUDA_ENABLED__
     if (device.kind != IONIC_DEVICE_CPU && device.kind != IONIC_DEVICE_CUDA) {
         ctx->error = IONIC_ERR(IONIC_ERROR_UNSUPPORTED_DEVICE);
-        IONIC_ERROR(&ctx->logger, IONIC_CONTEXT_EVENT_TAG, "initialization failed reason=%s unsupported", IONIC_DEVICE_LITERAL[device.kind]);
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_CONTEXT, "initialization failed reason=%s unsupported", IONIC_DEVICE_LITERAL[device.kind]);
         return;
     }
 #else
@@ -67,11 +67,11 @@ void ionic_context_init(struct ionic_context *ctx, struct ionic_device device) {
 #endif
 
     ionic_allocator_init(ctx, device);
-    IONIC_DEBUG(&ctx->logger, IONIC_CONTEXT_EVENT_TAG, "initialized");
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_CONTEXT, "initialized");
 }
 
 void ionic_context_destroy(ionic_context_t *ctx) {
     if(ctx->backend && ctx->backend->destroy) ctx->backend->destroy(ctx);
     ionic_topology_destroy(ctx);
-    IONIC_DEBUG(&ctx->logger, IONIC_CONTEXT_EVENT_TAG, "destroyed");
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_CONTEXT, "destroyed");
 }

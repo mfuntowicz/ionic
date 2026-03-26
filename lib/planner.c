@@ -32,6 +32,7 @@ void ionic_planner_destroy(ionic_planner_t *planner) {
     if(planner) {
         if(planner->destroy) planner->destroy(planner);
         if(planner->infos) free(planner->infos);
+        
         planner->infos = NULL;
         planner->n = 0;
         planner->n_registered = 0;

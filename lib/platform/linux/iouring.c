@@ -9,7 +9,7 @@
 #include "ionic/ionic.h"
 #include "ionic/platform/linux/iouring.h"
 
-#define IONIC_IOURING_TAG "io-uring"
+#define IONIC_EVENT_TAG_IOURING "io-uring"
 
 #define IONIC_IOURING_QD_ENV_VAR   "IONIC_IOURING_QUEUE_DEPTH"
 
@@ -162,27 +162,27 @@ static int ionic_iouring_register_fd(struct ionic_context *ctx, struct ionic_bac
 
     for (size_t i = 0; i < table->count; ++i) {
         if (table->fds[i] == fd) {
-            IONIC_TRACE(&ctx->logger, IONIC_IOURING_TAG, "fd already registered fd=%d idx=%d", fd, i);
+            IONIC_TRACE(&ctx->logger, IONIC_EVENT_TAG_IOURING, "fd already registered fd=%d idx=%d", fd, i);
             return (int)i;
         }
     }
 
     if (table->count >= IONIC_IOURING_MAX_FDS) {
-        IONIC_ERROR(&ctx->logger, IONIC_IOURING_TAG, "fd table full max=%d", IONIC_IOURING_MAX_FDS);
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOURING, "fd table full max=%d", IONIC_IOURING_MAX_FDS);
         return -1;
     }
 
     int idx = (int) table->count;
     int ret = io_uring_register_files_update(be->ring, (unsigned)idx, &fd, 1);
     if (ret < 0) {
-        IONIC_ERROR(&ctx->logger, IONIC_IOURING_TAG, "fd register failed fd=%d idx=%d errno=%d", fd, idx, -ret);
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOURING, "fd register failed fd=%d idx=%d errno=%d", fd, idx, -ret);
         return -1;
     }
 
     table->fds[idx] = fd;
     table->count++;
 
-    IONIC_DEBUG(&ctx->logger, IONIC_IOURING_TAG, "fd registered fd=%d idx=%d total=%zu", fd, idx, table->count);
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOURING, "fd registered fd=%d idx=%d total=%zu", fd, idx, table->count);
     return idx;
 }
 
@@ -192,17 +192,17 @@ static unsigned short ionic_iouring_get_queue_depth(struct ionic_context *ctx)
 {
     char *qd_env = getenv(IONIC_IOURING_QD_ENV_VAR);
     if (!qd_env) {
-        IONIC_DEBUG(&ctx->logger, IONIC_IOURING_TAG, "queue depth env not set env_var=%s default=%u", IONIC_IOURING_QD_ENV_VAR, IONIC_IOURING_QD_DEFAULT);
+        IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOURING, "queue depth env not set env_var=%s default=%u", IONIC_IOURING_QD_ENV_VAR, IONIC_IOURING_QD_DEFAULT);
         return IONIC_IOURING_QD_DEFAULT;
     }
 
     unsigned long depth = strtoul(qd_env, NULL, 10);
     if (depth == 0) {
-        IONIC_WARN(&ctx->logger, IONIC_IOURING_TAG, "queue depth env invalid requested=%lu default=%u", depth, IONIC_IOURING_QD_DEFAULT);
+        IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOURING, "queue depth env invalid requested=%lu default=%u", depth, IONIC_IOURING_QD_DEFAULT);
         return IONIC_IOURING_QD_DEFAULT;
     }
     if (depth > 1024) {
-        IONIC_WARN(&ctx->logger, IONIC_IOURING_TAG, "queue depth env clamped requested=%lu max=1024", depth);
+        IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOURING, "queue depth env clamped requested=%lu max=1024", depth);
         depth = 1024;
     }
     return (unsigned short)depth;
@@ -214,7 +214,7 @@ static unsigned short ionic_iouring_get_sq_thread_cpu(struct ionic_context *ctx)
 {
     FILE *fp = fopen("/proc/stat", "r");
     if (!fp) {
-        IONIC_WARN(&ctx->logger, IONIC_IOURING_TAG, "/proc/stat open failed");
+        IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOURING, "/proc/stat open failed");
         return 0;
     }
 
@@ -259,7 +259,7 @@ static unsigned short ionic_iouring_get_sq_thread_cpu(struct ionic_context *ctx)
 
     
     fclose(fp);
-    IONIC_DEBUG(&ctx->logger, IONIC_IOURING_TAG, "sq_thread_cpu selected core=%u idle_%=%.1f", best_cpu, best_idle_ratio * 100.0);
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOURING, "sq_thread_cpu selected core=%u idle_%=%.1f", best_cpu, best_idle_ratio * 100.0);
     return best_cpu;
 }
 
@@ -277,7 +277,7 @@ static int ionic_arena_init(struct ionic_context *ctx, struct ionic_staging_aren
                       -1, 0);
 
     if (arena->buf == MAP_FAILED) {
-        IONIC_ERROR(&ctx->logger, IONIC_IOURING_TAG, "arena mmap failed size=%zu errno=%d", arena->length, errno);
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOURING, "arena mmap failed size=%zu errno=%d", arena->length, errno);
         return -1;
     }
 
@@ -290,7 +290,7 @@ static int ionic_arena_init(struct ionic_context *ctx, struct ionic_staging_aren
     for (size_t i = 0; i < nslots; ++i)
         arena_slot_set_free(arena, i);
 
-    IONIC_INFO(&ctx->logger, IONIC_IOURING_TAG, "arena ready slots=%zu slot_size=%u total=%zu", nslots, IONIC_IOURING_SLOT_SIZE, arena->length);
+    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_IOURING, "arena ready slots=%zu slot_size=%u total=%zu", nslots, IONIC_IOURING_SLOT_SIZE, arena->length);
     return 0;
 }
 
@@ -335,7 +335,7 @@ static size_t ionic_iouring_handle_completions(struct ionic_context *ctx, struct
         unpack_cookie(cqe->user_data, &slot, &pad, &len);
 
         if (cqe->user_data & IONIC_IOURING_COOKIE_CHUNKED) {
-            IONIC_ERROR(&ctx->logger, IONIC_IOURING_TAG, "unexpected chunked cqe in sync read path");
+            IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOURING, "unexpected chunked cqe in sync read path");
             ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_IOURING));
             io_uring_cqe_seen(be->ring, cqe);
             be->inflight--;
@@ -344,7 +344,7 @@ static size_t ionic_iouring_handle_completions(struct ionic_context *ctx, struct
         }
 
         if (cqe->res < 0) {
-            IONIC_ERROR(&ctx->logger, IONIC_IOURING_TAG, "cqe nack slot=%u res=%d", slot, cqe->res);
+            IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOURING, "cqe nack slot=%u res=%d", slot, cqe->res);
             ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_IOURING));
             goto exit;
         }
@@ -360,7 +360,7 @@ static size_t ionic_iouring_handle_completions(struct ionic_context *ctx, struct
 
         *bytes_out += to_copy;
 
-        IONIC_TRACE(&ctx->logger, IONIC_IOURING_TAG,
+        IONIC_TRACE(&ctx->logger, IONIC_EVENT_TAG_IOURING,
                     "cqe ack slot=%u pad=%u len=%zu res=%d copied=%zu dst=%p",
                     slot, pad, len, cqe->res, to_copy, (void *)be->flights[slot].dst);
 
@@ -380,7 +380,7 @@ size_t ionic_iouring_read(struct ionic_context *ctx, int fd, unsigned char *dst,
 {
     struct ionic_backend_iouring *be = (struct ionic_backend_iouring *)ctx->backend;
 
-    IONIC_DEBUG(&ctx->logger, IONIC_IOURING_TAG, "read fd=%d dst=%p len=%zu offset=%zu", fd, dst, len, offset);
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOURING, "read fd=%d dst=%p len=%zu offset=%zu", fd, dst, len, offset);
 
     int fixed_fd = ionic_iouring_register_fd(ctx, be, fd);
     if (fixed_fd < 0) {
@@ -435,7 +435,7 @@ size_t ionic_iouring_read(struct ionic_context *ctx, int fd, unsigned char *dst,
         pending_submits++;
         pos += chunk;
 
-        IONIC_TRACE(&ctx->logger, IONIC_IOURING_TAG,
+        IONIC_TRACE(&ctx->logger, IONIC_EVENT_TAG_IOURING,
                     "sqe slot=%zu file_off=%zu aligned=%zu pad=%zu "
                     "io_len=%zu chunk=%zu inflight=%zu",
                     slot, file_off, aligned_off, pad, io_len, chunk, be->inflight);
@@ -454,7 +454,7 @@ size_t ionic_iouring_read(struct ionic_context *ctx, int fd, unsigned char *dst,
         ionic_iouring_handle_completions(ctx, be, be->depth, /*block=*/1, &read_bytes);
     
 
-    IONIC_DEBUG(&ctx->logger, IONIC_IOURING_TAG, "read done fd=%d requested=%zu got=%zu", fd, len, read_bytes);
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOURING, "read done fd=%d requested=%zu got=%zu", fd, len, read_bytes);
 
     return read_bytes;
 }
@@ -472,7 +472,7 @@ void ionic_iouring_destroy(struct ionic_context *ctx)
     free(be->ring);
     free(be);
     ctx->backend = NULL;
-    IONIC_INFO(&ctx->logger, IONIC_IOURING_TAG, "destroyed");
+    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_IOURING, "destroyed");
 }
 
 /* ── public: init ─────────────────────────────────────────────────── */
@@ -525,13 +525,13 @@ void ionic_iouring_init(struct ionic_context *ctx)
     ret = io_uring_register_buffers(be->ring, &iov, 1);
     be->use_fixed_buffers = (ret >= 0);
     if (ret < 0)
-        IONIC_WARN(&ctx->logger, IONIC_IOURING_TAG, "register_buffers_failed errno=%d (continuing without fixed buffers)", -ret);
+        IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOURING, "register_buffers_failed errno=%d (continuing without fixed buffers)", -ret);
 
     /* Pre-register a sparse fd table so fds can be added at read time. */
     ionic_fd_table_init(&be->fds);
     ret = io_uring_register_files_sparse(be->ring, IONIC_IOURING_MAX_FDS);
     if (ret < 0) {
-        IONIC_WARN(&ctx->logger, IONIC_IOURING_TAG, "register_files_sparse_failed errno=%d (SQPOLL may not work)", -ret);
+        IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOURING, "register_files_sparse_failed errno=%d (SQPOLL may not work)", -ret);
     }
 
     be->flights = calloc(be->depth, sizeof(*be->flights));
@@ -548,7 +548,7 @@ void ionic_iouring_init(struct ionic_context *ctx)
     be->base = ionic_iouring_vtable;
     ctx->backend = &be->base;
 
-    IONIC_INFO(&ctx->logger, IONIC_IOURING_TAG,
+    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_IOURING,
                "ready qd=%zu sq_thread_cpu=%u sq_thread_idle=%u arena=%zu slots=%zu chunk=%u fixed_bufs=%s",
                be->depth, params.sq_thread_cpu, params.sq_thread_idle,
                be->arena.length, be->arena.nslots, IONIC_IOURING_SLOT_SIZE,
@@ -737,7 +737,7 @@ static void ionic_cuda_bind_numa_for_staging_alloc(struct ionic_context *ctx)
 //     unpack_cookie_chunked(ud, &cuda_slot, &pad, &expect_len);
 
 //     if (cuda_slot >= IONIC_STAGING_SLOTS) {
-//         IONIC_ERROR(&ctx->logger, IONIC_IOURING_TAG, "chunked cqe bad slot=%u", cuda_slot);
+//         IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOURING, "chunked cqe bad slot=%u", cuda_slot);
 //         ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_IOURING));
 //         io_uring_cqe_seen(be->ring, cqe);
 //         be->inflight--;
@@ -745,7 +745,7 @@ static void ionic_cuda_bind_numa_for_staging_alloc(struct ionic_context *ctx)
 //     }
 
 //     if (cqe->res < 0) {
-//         IONIC_ERROR(&ctx->logger, IONIC_IOURING_TAG, "chunked cqe nack slot=%u res=%d", cuda_slot, cqe->res);
+//         IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOURING, "chunked cqe nack slot=%u res=%d", cuda_slot, cqe->res);
 //         ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_IOURING));
 //         io_uring_cqe_seen(be->ring, cqe);
 //         be->inflight--;
@@ -754,7 +754,7 @@ static void ionic_cuda_bind_numa_for_staging_alloc(struct ionic_context *ctx)
 //     }
 
 //     if ((size_t)cqe->res < expect_len) {
-//         IONIC_ERROR(&ctx->logger, IONIC_IOURING_TAG, "chunked cqe short read slot=%u got=%d want=%zu", cuda_slot, cqe->res, expect_len);
+//         IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOURING, "chunked cqe short read slot=%u got=%d want=%zu", cuda_slot, cqe->res, expect_len);
 //         ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_IOURING));
 //         io_uring_cqe_seen(be->ring, cqe);
 //         be->inflight--;
@@ -764,7 +764,7 @@ static void ionic_cuda_bind_numa_for_staging_alloc(struct ionic_context *ctx)
 
 //     struct ionic_staging_slot_cuda *sl = &ctx->cuda_slots[cuda_slot];
 //     if (atomic_load_explicit(&sl->state, memory_order_acquire) != IONIC_SLOT_FILLING) {
-//         IONIC_ERROR(&ctx->logger, IONIC_IOURING_TAG, "chunked cqe bad state slot=%u", cuda_slot);
+//         IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOURING, "chunked cqe bad state slot=%u", cuda_slot);
 //         ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_IOURING));
 //         io_uring_cqe_seen(be->ring, cqe);
 //         be->inflight--;
