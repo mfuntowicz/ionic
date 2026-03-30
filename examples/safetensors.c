@@ -49,16 +49,15 @@ int main(int argc, char **argv)
         return 3;
     }
 
-    struct ionic_planner *planner = ionic_planner_init(&ctx, registry.n, 0, world_size);
+    struct ionic_planner *planner = ionic_planner_init(&ctx, registry.n_tensors, 0, world_size);
+    for (size_t i = 0; i < registry.n_tensors; i++)
+        ionic_planner_shard(&ctx, planner, &registry.tensors[i], IONIC_SHARDING_REPLICATED);
 
-    if (!ionic_has_error(&ctx.error)) {
-        for (size_t i = 0; i < registry.n; i++)
-            ionic_planner_register_sharding(&ctx, planner, &registry.tensors[i], IONIC_SHARDING_REPLICATED, registry.fds[i]);
-    }
+    struct ionic_sharding_plan plan = ionic_planner_materialize_plan(&ctx, planner);
+    struct ionic_pipeline *pipeline = ionic_pipeline_probe(&ctx, world_size);
 
-    struct ionic_sharding_plan plan = ionic_planner_materialize_plan(&ctx, planner, 0);
-    struct ionic_pipeline *pipeline = ionic_pipeline_init(&ctx, ionic_pipeline_config_default(ctx.device));
-    int num_tensors = ionic_pipeline_execute_plan(&ctx, pipeline, &plan, planner->rank);
+    ionic_pipeline_init(&ctx, pipeline, registry.locations, registry.files, registry.n_tensors, registry.n_files);
+    size_t n = ionic_pipeline_execute(&ctx, pipeline, &plan, 0);
 
     ionic_planner_destroy(planner);
     ionic_safetensors_destroy(&registry);
