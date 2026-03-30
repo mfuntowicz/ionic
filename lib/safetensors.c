@@ -277,12 +277,11 @@ static size_t ionic_safetensors_discover_tensors_from_index(
         goto ko;
     }
 
-    registry->tensors = calloc(registry->n_tensors, sizeof(ionic_tensor_t));
-    registry->names   = calloc(registry->n_tensors, sizeof(char *));
-    if (!registry->tensors || !registry->names) goto freeup;
-
+    registry->tensors     = calloc(registry->n_tensors, sizeof(ionic_tensor_t));
+    registry->locations   = calloc(registry->n_tensors, sizeof(unsigned short));
+    registry->names       = calloc(registry->n_tensors, sizeof(char *));
     registry->files = calloc(registry->n_tensors, sizeof(char *));
-    if (!registry->files) {
+    if (!registry->tensors || !registry->locations || !registry->names || !registry->files) {
         ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
         goto freeup;
     }
