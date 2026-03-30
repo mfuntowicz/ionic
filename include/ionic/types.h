@@ -5,6 +5,27 @@
 #include <stddef.h>
 #include <stdatomic.h>
 
+#define IONIC_FALSE 0u
+typedef unsigned char ionic_bool;
+typedef ionic_bool ionic_bool_t;
+
+struct ionic_context;
+
+#if defined(_WIN32)
+#include <windows.h>
+typedef HANDLE ionic_fd;
+#else
+typedef int ionic_fd;
+#endif
+
+typedef ionic_fd ionic_fd_t;
+
+struct ionic_file {
+    ionic_fd fd;
+    void *content;
+};
+
+typedef struct ionic_file ionic_file_t;
 
 typedef enum ionic_device_kind {
     IONIC_DEVICE_CPU,
@@ -25,8 +46,6 @@ enum ionic_allocation_kind {
     IONIC_ALLOC_DEVICE,
     IONIC_ALLOC_STAGING,
 };
-
-struct ionic_context;
 
 typedef struct ionic_allocator {
     void *(*allocate)(struct ionic_context *ctx, size_t size, enum ionic_allocation_kind kind);

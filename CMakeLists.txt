@@ -25,6 +25,7 @@ set(IONIC_HEADERS
     include/ionic/ionic.h 
     include/ionic/types.h
     include/ionic/error.h
+    include/ionic/file.h
     include/ionic/logging.h
     include/ionic/topology.h
     include/ionic/planner.h
@@ -32,6 +33,8 @@ set(IONIC_HEADERS
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     include(cmake/liburing.cmake)
+    list(APPEND IONIC_HEADERS include/ionic/platform/linux/file.h)
+    list(APPEND IONIC_HEADERS include/ionic/platform/linux/iouring.h)
     list(APPEND IONIC_SOURCES lib/platform/linux/topology.c)
     list(APPEND IONIC_SOURCES lib/platform/linux/iouring.c)
     list(APPEND IONIC_SOURCES lib/platform/linux/memory.c)
