@@ -34,9 +34,8 @@ set(IONIC_HEADERS
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     include(cmake/liburing.cmake)
     list(APPEND IONIC_HEADERS include/ionic/platform/linux/file.h)
-    list(APPEND IONIC_HEADERS include/ionic/platform/linux/iouring.h)
+
     list(APPEND IONIC_SOURCES lib/platform/linux/topology.c)
-    list(APPEND IONIC_SOURCES lib/platform/linux/iouring.c)
     list(APPEND IONIC_SOURCES lib/platform/linux/memory.c)
     list(APPEND IONIC_LIBS liburing_static)
     add_compile_definitions(_GNU_SOURCE)

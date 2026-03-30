@@ -2,7 +2,6 @@
 #include "ionic/error.h"
 #include "ionic/ionic.h"
 #include "ionic/topology.h"
-#include "ionic/platform/linux/iouring.h"  //todo(mfuntowicz): remove that platform depend stuff
 
 #ifdef __IONIC_CUDA_ENABLED__
 #include <ionic/devices/cuda.h>
