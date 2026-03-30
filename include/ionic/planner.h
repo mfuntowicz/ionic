@@ -24,39 +24,33 @@ static const char* IONIC_SHARDING_KIND_NAMES[] = {
 
 struct ionic_sharding_info {
     const struct ionic_tensor *tensor;
-    enum ionic_sharding_kind kind;
-    int fd;
+    enum ionic_sharding_kind  kind;
 };
 
 struct ionic_sharded_tensor_specs {
     struct ionic_device device;
-    size_t start;
-    size_t end;
-    void *dst;  // nullable
+    size_t              start;
+    size_t              end;
+    void                *dst;  // nullable
 };
 
 struct ionic_sharded_tensor {
     struct ionic_sharded_tensor_specs *specs;  // [world_size], specs for each rank
-    const struct ionic_tensor *tensor;
-    int fd;
+    const struct ionic_tensor         *tensor;
 };
 
 struct ionic_sharding_plan {
     struct ionic_sharded_tensor *tensors;
-    size_t n;
-    size_t world_size;
+    size_t                      n;
+    size_t                      world_size;
 };
 
 struct ionic_planner {
     struct ionic_sharding_info *infos;
-    size_t n;
-    size_t n_registered;
-    unsigned short world_size;
-    unsigned short rank;
-
-    void (*initialize)(struct ionic_context *, struct ionic_planner *);
-    void (*destroy)(struct ionic_planner *);
-    void (*execute)(struct ionic_context *, struct ionic_planner *, struct ionic_sharding_plan *);
+    size_t                     n;
+    size_t                     n_registered;
+    unsigned short             world_size;
+    unsigned short             rank;
 };
 
 typedef enum ionic_allocation_kind ionic_allocation_kind_t;
@@ -66,25 +60,4 @@ typedef struct ionic_sharding_specs ionic_sharding_specs_t;
 typedef struct ionic_sharding_plan ionic_sharding_plan_t;
 typedef struct ionic_planner ionic_planner_t;
 
-
-#ifdef __IONIC_CUDA_ENABLED__
-#include <cuda_runtime.h>
-
-#define IONIC_PLANNER_CUDA_STAGING_COUNT 2
-
-struct ionic_planner_cuda {
-    struct ionic_planner base;
-    cudaStream_t         stream;
-    void                *staging[IONIC_PLANNER_CUDA_STAGING_COUNT];  // Pinned host buffers
-    size_t               staging_size;                                // Per-buffer capacity
-    cudaEvent_t          staging_done[IONIC_PLANNER_CUDA_STAGING_COUNT];  // Events per buffer
-};
-
-typedef struct ionic_planner_cuda ionic_planner_cuda_t;
-
-void ionic_planner_cuda_single_gpu_init(struct ionic_context *, struct ionic_planner *);
-void ionic_planner_cuda_single_gpu_destroy(struct ionic_planner *);
-void ionic_planner_cuda_execute(struct ionic_context *, struct ionic_planner *, struct ionic_sharding_plan *);
-
-#endif // __IONIC_CUDA_ENABLED__
 #endif // IONIC_PLANNER_H
