@@ -29,6 +29,7 @@ set(IONIC_HEADERS
     include/ionic/logging.h
     include/ionic/topology.h
     include/ionic/planner.h
+    include/ionic/pipeline.h
 )
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -45,6 +46,9 @@ if(IONIC_ENABLE_CUDA)
     message(STATUS "CUDA support enabled")
     find_package(CUDAToolkit REQUIRED COMPONENTS CUDA::cudart)
     list(APPEND IONIC_LIBS CUDA::cudart)
+
+    list(APPEND IONIC_HEADERS include/ionic/pipelines/cuda.h)
+    list(APPEND IONIC_SOURCES lib/pipelines/cuda.c)
 
     add_compile_definitions(__IONIC_CUDA_ENABLED__=1)
 endif()
