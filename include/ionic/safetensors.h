@@ -5,19 +5,25 @@
 extern "C" {
 #endif
 
+#define SAFETENSORS_MAX_HEADER_SIZE
+
 #include <stddef.h>
 #include <ionic/types.h>
 
 struct ionic_safetensors {
-    ionic_tensor_t *tensors;
-    char           **names;
-    char           **files;
-    size_t         n_tensors;
-    size_t         n_files;
-    size_t         hdr_size;
+    struct ionic_tensor *tensors;
+    unsigned short      *locations;
+    char                **names;
+    char                **files;
+    size_t              n_tensors;
+    size_t              n_files;
+    size_t              hdr_size;
+    unsigned char       _pad[8];
 };
 
 typedef struct ionic_safetensors ionic_safetensors_t;
+
+static_assert(sizeof(struct ionic_safetensors) == 64, "struct ionic_safetensors is");
 
 void ionic_safetensors_init(struct ionic_safetensors *);
 void ionic_safetensors_destroy(struct ionic_safetensors *);

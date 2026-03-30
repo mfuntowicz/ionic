@@ -170,7 +170,7 @@ void ionic_safetensors_destroy(ionic_safetensors_t *registry) {
 }
 
 static size_t ionic_safetensors_extract_registry(
-    struct ionic_context *ctx, struct ionic_safetensors *registry, yyjson_val *const root, size_t offset, ionic_fd fd) {
+    struct ionic_context *ctx, struct ionic_safetensors *registry, yyjson_val *const root, size_t offset, unsigned short file) {
     if(ionic_has_error(&ctx->error) || !root) goto ko;
 
     size_t n = yyjson_obj_size(root);
@@ -209,6 +209,7 @@ static size_t ionic_safetensors_extract_registry(
         tensor->start += registry->hdr_size + sizeof(registry->hdr_size);
         tensor->end += registry->hdr_size + sizeof(registry->hdr_size);
         registry->names[offset + tidx] = strndup(name, yyjson_get_len(key));
+        registry->locations[offset + tidx] = file;
         tidx++;
 
         IONIC_TRACE(
@@ -219,7 +220,7 @@ ko:
     return 0;
 }
 
-static size_t ionic_safetensors_discover_tensors_from_file(ionic_context_t *ctx, ionic_safetensors_t *registry, const char *const path, size_t offset) {
+static size_t ionic_safetensors_discover_tensors_from_file(ionic_context_t *ctx, ionic_safetensors_t *registry, const char *const path, size_t offset, unsigned short file) {
     IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "file path=%s", path);
     
     if(ionic_has_error(&ctx->error)) goto ko;
@@ -246,7 +247,7 @@ static size_t ionic_safetensors_discover_tensors_from_file(ionic_context_t *ctx,
             goto ko;
         }
 
-        size_t count = ionic_safetensors_extract_registry(ctx, registry, root, offset, f.fd);
+        size_t count = ionic_safetensors_extract_registry(ctx, registry, root, offset, file);
         yyjson_doc_free(doc);
         return count;
     }
@@ -315,7 +316,7 @@ static size_t ionic_safetensors_discover_tensors_from_index(
         char *shard_path = ionic_path_join(workspace, workspace_len, registry->files[fi], strlen(registry->files[fi]));
         if (!shard_path) goto freeup_files;
 
-        offset += ionic_safetensors_discover_tensors_from_file(ctx, registry, shard_path, offset);
+        offset += ionic_safetensors_discover_tensors_from_file(ctx, registry, shard_path, offset, fi);
         free(shard_path);
         free(registry->files[fi]);
 
@@ -355,7 +356,7 @@ size_t ionic_safetensors_discover_tensors(ionic_context_t *ctx, ionic_safetensor
 
         yyjson_doc_free(doc);
     } else {
-        n_tensors = ionic_safetensors_discover_tensors_from_file(ctx, registry, path, 0);
+        n_tensors = ionic_safetensors_discover_tensors_from_file(ctx, registry, path, 0, 0);
     }
 
     return n_tensors;
