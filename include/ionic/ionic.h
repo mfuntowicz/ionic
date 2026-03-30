@@ -74,52 +74,6 @@ IONIC_EXTERN void ionic_free_device(struct ionic_context *, void *, enum ionic_a
 
 IONIC_EXTERN void ionic_barrier_wait(struct ionic_barrier *) NO_EXCEPT;
 
-#include "pipeline.h"
-#include "planner.h"
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Pipeline API
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-IONIC_EXTERN struct ionic_pipeline *ionic_pipeline_init(struct ionic_context *, struct ionic_pipeline_config) NO_EXCEPT;
-IONIC_EXTERN void ionic_pipeline_destroy(struct ionic_pipeline *) NO_EXCEPT;
-IONIC_EXTERN int ionic_pipeline_execute_plan(struct ionic_context *, struct ionic_pipeline *, struct ionic_sharding_plan *, unsigned short rank) NO_EXCEPT;
-IONIC_EXTERN ionic_tensor_state_t ionic_tensor_status_get_state(const struct ionic_tensor_status *) NO_EXCEPT;
-IONIC_EXTERN size_t ionic_tensor_status_get_bytes_loaded(const struct ionic_tensor_status *) NO_EXCEPT;
-IONIC_EXTERN size_t ionic_tensor_status_get_total_bytes(const struct ionic_tensor_status *) NO_EXCEPT;
-IONIC_EXTERN bool ionic_tensor_status_is_complete(const struct ionic_tensor_status *) NO_EXCEPT;
-IONIC_EXTERN bool ionic_tensor_status_has_error(const struct ionic_tensor_status *, int *err_code) NO_EXCEPT;
-IONIC_EXTERN const struct ionic_tensor_status *ionic_pipeline_get_tensor_status(const struct ionic_pipeline *, size_t) NO_EXCEPT;
-IONIC_EXTERN size_t ionic_pipeline_get_bytes_total(const struct ionic_pipeline *) NO_EXCEPT;
-IONIC_EXTERN size_t ionic_pipeline_get_bytes_loaded(const struct ionic_pipeline *) NO_EXCEPT;
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Backend Interface
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/* I/O completion result */
-struct ionic_io_completion {
-    void   *staging_buffer;   /* Pointer to staging buffer containing data */
-    size_t   bytes_read;      /* Number of bytes read */
-    void    *userdata;        /* User data passed to submit_read */
-    size_t   staging_slot;    /* Slot index for release_staging() */
-};
-
-struct ionic_backend {
-    void (*destroy)(struct ionic_context *);
-    
-    /* Synchronous read (legacy) */
-    size_t (*read)(struct ionic_context *, int fd, unsigned char *dst, size_t len, size_t offset);
-    
-    /* Async I/O operations */
-    int (*submit_read)(struct ionic_context *, int fd, size_t offset, size_t len, void *userdata);
-    size_t (*poll_completions)(struct ionic_context *, struct ionic_io_completion *completions, size_t max_completions);
-    size_t (*get_inflight)(struct ionic_context *);
-    void *(*acquire_staging)(struct ionic_context *, size_t len, size_t *slot);
-    void (*release_staging)(struct ionic_context *, size_t slot);
-};
-typedef struct ionic_backend ionic_backend_t;
-
 struct ionic_context {
     struct ionic_error  error;
     struct ionic_device device;

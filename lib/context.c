@@ -6,7 +6,6 @@
 
 #ifdef __IONIC_CUDA_ENABLED__
 #include <ionic/devices/cuda.h>
-#include <stdatomic.h>
 #endif
 
 #if defined(__linux__)
@@ -49,8 +48,8 @@ void ionic_context_init(struct ionic_context *ctx, struct ionic_device device) {
     ctx->device = device;
 
     ionic_logger_init(&ctx->logger);
+    ionic_allocator_init(ctx, device);
     ionic_topology_init(ctx);
-    ionic_iouring_init(ctx);
 
 #ifdef __IONIC_CUDA_ENABLED__
     if (device.kind != IONIC_DEVICE_CPU && device.kind != IONIC_DEVICE_CUDA) {
@@ -66,12 +65,10 @@ void ionic_context_init(struct ionic_context *ctx, struct ionic_device device) {
     }
 #endif
 
-    ionic_allocator_init(ctx, device);
     IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_CONTEXT, "initialized");
 }
 
 void ionic_context_destroy(ionic_context_t *ctx) {
-    if(ctx->backend && ctx->backend->destroy) ctx->backend->destroy(ctx);
     ionic_topology_destroy(ctx);
     IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_CONTEXT, "destroyed");
 }
