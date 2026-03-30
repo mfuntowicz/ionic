@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 #include <stddef.h>
+#include <ionic/types.h>
 
 struct ionic_safetensors {
     ionic_tensor_t *tensors;

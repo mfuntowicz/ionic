@@ -181,7 +181,6 @@ static size_t ionic_safetensors_extract_registry(
         registry->n_tensors = n;
         registry->tensors   = calloc(n, sizeof(ionic_tensor_t));
         registry->names     = calloc(n, sizeof(char *));
-        //todo(mfuntowicz) registry->files   = calloc(n, sizeof(int));
         if(!registry->tensors || !registry->names) {
             IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "allocation_failed");
             goto ko;
@@ -213,7 +212,7 @@ static size_t ionic_safetensors_extract_registry(
         tidx++;
 
         IONIC_TRACE(
-            &ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "\tstart=%-12zu end=%-12zu tensor name=\"%s\"", tensor->start,  tensor->end, name);
+            &ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "\tstart=%-12zu end=%-12zu tensor name=%s", tensor->start,  tensor->end, name);
     }
     return tidx;
 ko:
@@ -221,29 +220,29 @@ ko:
 }
 
 static size_t ionic_safetensors_discover_tensors_from_file(ionic_context_t *ctx, ionic_safetensors_t *registry, const char *const path, size_t offset) {
-    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "file path=\"%s\"", path);
+    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "file path=%s", path);
     
     if(ionic_has_error(&ctx->error)) goto ko;
 
     struct ionic_file f = ionic_ro_mmap(path);
     if(f.fd < 0) {
-        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "open failed errno=%d path=\"%s\"", errno, path);
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "open failed errno=%d path=%s", errno, path);
         goto ko;
     }
     
     memcpy(&registry->hdr_size, f.content, sizeof(registry->hdr_size));
     if(registry->hdr_size > 0) {
-        IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "read success hsize=%-12zu path=\"%s\"", registry->hdr_size, path);
+        IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "read success hsize=%-12zu path=%s", registry->hdr_size, path);
 
         yyjson_doc *doc = yyjson_read(f.content + sizeof(uint64_t), registry->hdr_size, YYJSON_READ_NOFLAG);
         if(!doc){
-            IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "read failed errno=%-2d path=\"%s\"", errno, path);
+            IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "read failed errno=%-2d path=%s", errno, path);
             goto ko;
         }
 
         yyjson_val *root = yyjson_doc_get_root(doc);
         if(!root){
-            IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "read failed errno=%-2d path=\"%s\"", errno, path);
+            IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "read failed errno=%-2d path=%s", errno, path);
             goto ko;
         }
 
@@ -347,7 +346,7 @@ size_t ionic_safetensors_discover_tensors(ionic_context_t *ctx, ionic_safetensor
     size_t n_tensors = 0;
     yyjson_doc *doc = yyjson_read_file(path, YYJSON_READ_NOFLAG, NULL, NULL);
     if(doc) {
-        IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "index path=\"%s\"", path);
+        IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "index path=%s", path);
 
         char cwd[4096];  // max path length
         size_t length = ionic_path_parent(path, cwd, sizeof(cwd));
