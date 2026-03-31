@@ -59,7 +59,7 @@ void ionic_context_init(struct ionic_context *ctx, struct ionic_device device) {
 #else
     if (device.kind != IONIC_DEVICE_CPU) {
         ctx->error = IONIC_ERR(IONIC_ERROR_UNSUPPORTED_DEVICE);
-        IONIC_ERROR(&ctx->logger, IONIC_CONTEXT_EVENT_TAG, "initialization failed reason=%s not enabled", IONIC_DEVICE_LITERAL[device.kind]);
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_CONTEXT, "initialization failed reason=%s not enabled", IONIC_DEVICE_LITERAL[device.kind]);
         return;
     }
 #endif
