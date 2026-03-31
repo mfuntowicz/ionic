@@ -10,12 +10,13 @@
 struct ionic_pipeline_cuda {
     struct ionic_pipeline base;
     struct ionic_device   device;
-    cudaStream_t stream;
-    cudaEvent_t  event;
 
+    cudaStream_t *streams;
+    cudaEvent_t  *events;
+
+    unsigned char concurrency; // number of async copy engines on the device
     char tag[24];
 };
-
 
 struct ionic_pipeline *ionic_pipeline_cuda_create(struct ionic_context *, unsigned short world_size);
 

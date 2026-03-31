@@ -7,13 +7,25 @@ static void ionic_pipeline_cuda_destroy(struct ionic_pipeline *pipeline) {
     if (!pipeline) return;
 
     struct ionic_pipeline_cuda *pipeline_ = (struct ionic_pipeline_cuda *)pipeline;
-    if (pipeline_->stream) {
-        cudaStreamSynchronize(pipeline_->stream);
-        cudaStreamDestroy(pipeline_->stream);
+
+    if (pipeline_->events) {
+        for (unsigned char i = 0; i < pipeline_->concurrency; ++i) {
+            cudaEventSynchronize(pipeline_->events[i]);
+            cudaEventDestroy(pipeline_->events[i]);
+        }
+
+        free(pipeline_->events);
+        pipeline_->events = NULL;
     }
-    if (pipeline_->event) {
-        cudaEventSynchronize(pipeline_->event);
-        cudaEventDestroy(pipeline_->event);
+
+    if (pipeline_->streams) {
+        for (unsigned char i = 0; i < pipeline_->concurrency; ++i) {
+            cudaStreamSynchronize(pipeline_->streams[i]);
+            cudaStreamDestroy(pipeline_->streams[i]);
+        }
+
+        free(pipeline_->streams);
+        pipeline_->streams = NULL;
     }
 }
 
@@ -21,7 +33,55 @@ static void ionic_pipeline_cuda_initialize(struct ionic_context *ctx, struct ion
     if (ionic_has_error(&ctx->error)) return;
 
     struct ionic_pipeline_cuda *pipeline_ = (struct ionic_pipeline_cuda *)pipeline;
-    IONIC_TRACE(&ctx->logger, pipeline_->tag, "initialize");
+
+    enum cudaError cuErr;
+    if ((cuErr = cudaSetDevice(ctx->device.ordinal)) != cudaSuccess) {
+        struct ionic_error err = IONIC_CUDA_ERR_WITH_MSG(cuErr, cudaGetErrorString(cuErr));
+        IONIC_ERROR(&ctx->logger, pipeline_->tag, "cudaSetDevice(device=%hhu) failed err=%s", ctx->device.ordinal, err.what);
+        ionic_set_error(ctx, err);
+        return;
+    }
+
+    struct cudaDeviceProp props;
+    if ((cuErr = cudaGetDeviceProperties(&props, ctx->device.ordinal)) != cudaSuccess) {
+        IONIC_WARN(&ctx->logger, pipeline_->tag, "cudaGetDeviceProperties failed (%s)", cudaGetErrorString(cuErr));
+        pipeline_->concurrency = 1; // default to 1, safe
+    } else {
+        pipeline_->concurrency = props.asyncEngineCount < 1 ? 1 : props.asyncEngineCount;
+    }
+
+    pipeline_->events = calloc(pipeline_->concurrency, sizeof(cudaEvent_t));
+    pipeline_->streams = calloc(pipeline_->concurrency, sizeof(cudaStream_t));
+
+    if (!pipeline_->events || !pipeline_->streams) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+        IONIC_ERROR(&ctx->logger, pipeline_->tag,
+            "allocation failed cudaEvent_t=%p, cudaStream_t=%p, n=%hhu",
+            pipeline_->events, pipeline_->streams, pipeline_->concurrency);
+        goto ko;
+    }
+
+    for (unsigned char i = 0; i < pipeline_->concurrency; ++i) {
+        if ((cuErr = cudaStreamCreateWithFlags(pipeline_->streams + i, cudaStreamNonBlocking)) != cudaSuccess) {
+            struct ionic_error err = IONIC_CUDA_ERR_WITH_MSG(cuErr, cudaGetErrorString(cuErr));
+            IONIC_WARN(&ctx->logger, pipeline_->tag, "cudaStreamCreateWithFlags failed err=%s", err.what);
+            ionic_set_error(ctx, err);
+            goto ko;
+        }
+
+        if ((cuErr = cudaEventCreateWithFlags(pipeline_->events +i, cudaEventDisableTiming)) != cudaSuccess) {
+            struct ionic_error err = IONIC_CUDA_ERR_WITH_MSG(cuErr, cudaGetErrorString(cuErr));
+            IONIC_WARN(&ctx->logger, pipeline_->tag, "cudaEventCreateWithFlags failed err=%s", err.what);
+            ionic_set_error(ctx, err);
+            goto ko;
+        }
+    }
+
+    IONIC_TRACE(&ctx->logger, pipeline_->tag, "initialize concurrency=%hhu", pipeline_->concurrency);
+    return;
+
+ko:
+    ionic_pipeline_cuda_destroy(&pipeline_->base);
 }
 
 static void ionic_pipeline_cuda_execute(
@@ -37,9 +97,6 @@ struct ionic_pipeline *ionic_pipeline_cuda_create(struct ionic_context *ctx, uns
 
     struct ionic_pipeline_cuda *pipeline = malloc(sizeof(struct ionic_pipeline_cuda));
     snprintf(pipeline->tag, sizeof(pipeline->tag), "pipeline(cuda:%hhu)", ctx->device.ordinal);
-
-    cudaStreamCreateWithFlags(&pipeline->stream, cudaStreamNonBlocking);
-    cudaEventCreateWithFlags(&pipeline->event, cudaEventDisableTiming);
 
     pipeline->base.destroy = ionic_pipeline_cuda_destroy;
     pipeline->base.initialize = ionic_pipeline_cuda_initialize;
