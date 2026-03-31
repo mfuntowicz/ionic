@@ -3,6 +3,23 @@
 #include <ionic/logging.h>
 #include <stdlib.h>
 
+#ifdef __linux__
+#include <ionic/platform/linux/iouring.h>
+#endif
+
+static void *ionic_pipeline_probe_ioengine(struct ionic_context *ctx, struct ionic_pipeline *pipeline)
+{
+    struct ionic_pipeline_cuda *pipeline_ = (struct ionic_pipeline_cuda *)pipeline;
+    IONIC_TRACE(&ctx->logger, pipeline_->tag, "probing ioengine");
+#ifdef __linux__
+    struct ionic_iouring_engine_config p = { .qd = 64 };
+    return ionic_iouring_engine_create(ctx, &p);
+#else
+    ionic_set_error(ctx, IONIC_ERR_WITH_MSG(IONIC_ERROR_UNSUPPORTED, "platform not supported yet."))
+#endif
+    return NULL;
+}
+
 static void ionic_pipeline_cuda_destroy(struct ionic_pipeline *pipeline) {
     if (!pipeline) return;
 
@@ -77,7 +94,16 @@ static void ionic_pipeline_cuda_initialize(struct ionic_context *ctx, struct ion
         }
     }
 
-    IONIC_TRACE(&ctx->logger, pipeline_->tag, "initialize concurrency=%hhu", pipeline_->concurrency);
+    void *ioengine = ionic_pipeline_probe_ioengine(ctx, pipeline);
+    if (!ioengine) {
+        struct ionic_error err = IONIC_ERR_WITH_MSG(IONIC_ERROR_IOENGINE_INITIALIZATION_FAILED, "failed to get cuda ioengine");
+        IONIC_ERROR(&ctx->logger, pipeline_->tag, "probe failed: %s", err.what);
+        ionic_set_error(ctx, err);
+        return;
+    }
+
+    pipeline_->ioengine = ioengine;  //todo(mfuntowicz): move to struct ionic_pipeline?
+    IONIC_TRACE(&ctx->logger, pipeline_->tag, "initialized concurrency=%hhu", pipeline_->concurrency);
     return;
 
 ko:

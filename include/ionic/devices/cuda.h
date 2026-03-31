@@ -20,6 +20,7 @@ static inline void *ionic_cuda_naive_allocate(struct ionic_context *ctx, size_t 
         IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_DEVICES_CUDA, "allocating memory size=%zu, kind=device, device=%u", size, ctx->device.ordinal);
         if((err = cudaMalloc(&dst, size)) != cudaSuccess) {
             IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_DEVICES_CUDA, "allocation failed size=%zu, kind=device, error=%u", size, err);
+            ionic_set_error(ctx, IONIC_CUDA_ERR_WITH_MSG(err, "allocation failed"));
             return NULL;
         }
         break;
@@ -27,6 +28,7 @@ static inline void *ionic_cuda_naive_allocate(struct ionic_context *ctx, size_t 
         IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_DEVICES_CUDA, "allocating memory size=%zu, kind=staging, device=%u", size, ctx->device.ordinal);
         if ((err = cudaHostAlloc(&dst, size, cudaHostAllocDefault)) != cudaSuccess) {
             IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_DEVICES_CUDA, "allocation failed size=%zu, kind=staging, error=%u", size, (unsigned)err);
+            ionic_set_error(ctx, IONIC_CUDA_ERR_WITH_MSG(err, "allocation failed"));
             return NULL;
         }
         break;

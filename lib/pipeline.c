@@ -45,10 +45,10 @@ void ionic_pipeline_destroy(struct ionic_pipeline *pipeline) {
 }
 
 size_t ionic_pipeline_execute(struct ionic_context *ctx, struct ionic_pipeline *pipeline, const struct ionic_sharding_plan *plan, unsigned short rank) {
-    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "executing plan n=%zu", plan->n);
-
     if (ionic_has_error(&ctx->error)) return 0;
     if (!pipeline) return 0;
+
+    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "executing plan n=%zu", plan->n);
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC_COARSE, &start);
