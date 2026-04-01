@@ -3,6 +3,8 @@
 #include <ionic/logging.h>
 #include <stdlib.h>
 
+#include "ionic/utils.h"
+
 #ifdef __linux__
 #include <ionic/platform/linux/iouring.h>
 #endif
@@ -12,7 +14,7 @@ static void *ionic_pipeline_probe_ioengine(struct ionic_context *ctx, struct ion
     struct ionic_pipeline_cuda *pipeline_ = (struct ionic_pipeline_cuda *)pipeline;
     IONIC_TRACE(&ctx->logger, pipeline_->tag, "probing ioengine");
 #ifdef __linux__
-    struct ionic_iouring_engine_config p = { .qd = 64 };
+    struct ionic_iouring_engine_config p = { .qd = 32 };
     return ionic_iouring_engine_create(ctx, &p);
 #else
     ionic_set_error(ctx, IONIC_ERR_WITH_MSG(IONIC_ERROR_UNSUPPORTED, "platform not supported yet."))
@@ -116,6 +118,17 @@ static void ionic_pipeline_cuda_execute(
 
     struct ionic_pipeline_cuda *pipeline_ = (struct ionic_pipeline_cuda *)pipeline;
     IONIC_INFO(&ctx->logger, pipeline_->tag, "execute rank=%hu", rank);
+
+    for (unsigned i = 0; i < plan->n; ++i) {
+        const struct ionic_sharded_tensor target = plan->tensors[i];
+        const size_t nbytes = ionic_tensor_nbytes(target.tensor);
+
+        if ((target.specs->dst = ctx->dalloc.allocate(ctx, nbytes, IONIC_ALLOC_DEVICE)) == NULL) {
+            ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+            IONIC_ERROR(&ctx->logger, pipeline_->tag, "destination memory allocation failed");
+            return;
+        }
+    }
 }
 
 struct ionic_pipeline *ionic_pipeline_cuda_create(struct ionic_context *ctx, unsigned short world_size) {
