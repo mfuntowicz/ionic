@@ -35,6 +35,11 @@ void ionic_pipeline_init(
     if (ionic_has_error(&ctx->error)) return;
     if (!pipeline) return;
 
+    pipeline->locations = locations;
+    pipeline->files = files;
+    pipeline->n_tensors = n_tensors;
+    pipeline->n_files = n_files;
+
     pipeline->initialize(ctx, pipeline);
 }
 

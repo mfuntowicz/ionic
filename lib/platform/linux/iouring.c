@@ -112,14 +112,13 @@ static void ionic_iouring_engine_init(struct ionic_context *ctx, struct ionic_io
     IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "initialized ring");
 }
 
-static ionic_bool ionic_iouring_engine_can_submit(const struct ionic_context *ctx, const struct ionic_ioengine *engine) {
-    struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
-    return ionic_iouring_engine_has_free_slot(engine_->slots[0]) | ionic_iouring_engine_has_free_slot(engine_->slots[1]);
-}
+static void ionic_iouring_engine_fetch(
+    struct ionic_context *ctx, struct ionic_ioengine *engine, struct ionic_io_fragment *segments, const unsigned count) {
 
-static void ionic_iouring_engine_submit(struct ionic_context *ctx, struct ionic_ioengine *engine, const size_t start, const size_t end) {
     if (ionic_has_error(&ctx->error)) return;
-    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "submit start=%zu, end=%zu", start, end);
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "fetch count=%u", count);
+
+
 }
 
 static void ionic_iouring_engine_probe_ring(struct ionic_context *ctx, struct io_uring_params *params, unsigned qd) {
@@ -170,8 +169,8 @@ struct ionic_iouring_engine *ionic_iouring_engine_create(struct ionic_context *c
     engine->config          = *config;
     engine->base.initialize = ionic_iouring_engine_init;
     engine->base.destroy    = ionic_iouring_engine_destroy;
-    engine->base.submit     = ionic_iouring_engine_submit;
-    engine->base.can_submit = ionic_iouring_engine_can_submit;
+    engine->base.fetch      = ionic_iouring_engine_fetch;
+    engine->base.peek       = NULL;
 
     return engine;
 ko:

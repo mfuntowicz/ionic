@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #define IONIC_EVENT_TAG_PIPELINE_CUDA "pipeline(cuda)"
+#define IONIC_COALESCED_READ_THRESHOLD_DEFAULT (128 * 1024)
 
 struct ionic_pipeline_cuda {
     struct ionic_pipeline base;
@@ -15,7 +16,8 @@ struct ionic_pipeline_cuda {
     cudaStream_t *streams;
     cudaEvent_t  *events;
 
-    unsigned char concurrency; // number of async copy engines on the device
+    size_t threshold;
+    unsigned char concurrency;
     char tag[24];
 };
 

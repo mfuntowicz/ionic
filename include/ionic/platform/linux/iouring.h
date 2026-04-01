@@ -38,7 +38,7 @@ static inline unsigned char ionic_iouring_engine_has_free_slot(const unsigned lo
 
 static inline int ionic_iouring_engine_get_slot(const unsigned long slots[2]) {
     const unsigned long mask = slots[0] | slots[1];
-    return __builtin_ctzl(mask | (~mask + 1)) ^ (mask == 0);
+    return __builtin_ctzl(mask | (~mask + 1)) ^ (mask == 0);   // todo(mfuntowicz): limit to the actual queue depth
 }
 
 struct ionic_iouring_engine *ionic_iouring_engine_create(struct ionic_context *ctx, struct ionic_iouring_engine_config *config);
