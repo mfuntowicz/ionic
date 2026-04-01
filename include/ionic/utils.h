@@ -23,6 +23,7 @@ static inline size_t ionic_tensor_nbytes(const struct ionic_tensor *tensor) {
     return tensor->end - tensor->start;
 }
 
+static inline unsigned char ionic_is_power_of_two(const unsigned int n) { return n && !(n & (n - 1)); }
 static inline size_t ionic_align_down_sz(size_t v, size_t a) { return v & ~(a - 1); }
 static inline size_t ionic_align_up_sz(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 
