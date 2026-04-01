@@ -10,7 +10,7 @@
 struct ionic_pipeline_cuda {
     struct ionic_pipeline base;
     struct ionic_device   device;
-    void *ioengine;
+    struct ionic_ioengine *ioengine;
 
     cudaStream_t *streams;
     cudaEvent_t  *events;

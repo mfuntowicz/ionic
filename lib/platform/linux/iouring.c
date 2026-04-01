@@ -95,16 +95,43 @@ ko:
     if (base) ctx->dalloc.free(ctx, base, IONIC_ALLOC_STAGING);
 }
 
-static void ionic_iouring_engine_probe_ring(
-    struct ionic_context *ctx, struct ionic_iouring_engine *engine, struct io_uring_params *params, unsigned qd) {
+static void ionic_iouring_engine_destroy(struct ionic_ioengine *engine) {
+    struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
+}
+
+static void ionic_iouring_engine_init(struct ionic_context *ctx, struct ionic_ioengine *engine) {
+    if (ionic_has_error(&ctx->error)) return;
+
+    struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
+
+    engine_->slots[0] = engine_->slots[1] = SLOT_ALL_AVAILABLE;
+
+    ionic_iouring_engine_register_files(ctx, engine_);
+    ionic_iouring_engine_register_buffers(ctx, engine_);
+
+    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "initialized ring");
+}
+
+static ionic_bool ionic_iouring_engine_can_submit(const struct ionic_context *ctx, const struct ionic_ioengine *engine) {
+    struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
+    return ionic_iouring_engine_has_free_slot(engine_->slots[0]) | ionic_iouring_engine_has_free_slot(engine_->slots[1]);
+}
+
+static void ionic_iouring_engine_submit(struct ionic_context *ctx, struct ionic_ioengine *engine, const size_t start, const size_t end) {
+    if (ionic_has_error(&ctx->error)) return;
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "submit start=%zu, end=%zu", start, end);
+}
+
+static void ionic_iouring_engine_probe_ring(struct ionic_context *ctx, struct io_uring_params *params, unsigned qd) {
+    struct io_uring ring;
     int res = 0;
 
     params->flags |= IORING_SETUP_SQPOLL | IORING_SETUP_IOPOLL;
-    if ((res = io_uring_queue_init_params(qd, &engine->ring, params))) {
+    if ((res = io_uring_queue_init_params(qd, &ring, params))) {
         IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "io_uring_queue_init failed flags=IORING_SETUP_SQPOLL|IORING_SETUP_IOPOLL res=%i (%s)", -res, strerror(-res));
 
         params->flags = IORING_SETUP_SQPOLL;
-        if ((res = io_uring_queue_init_params(qd, &engine->ring, params))) {
+        if ((res = io_uring_queue_init_params(qd, &ring, params))) {
             struct ionic_error err = IONIC_SYS_ERR_WITH_MSG(-res, "io_uring_queue_init_params failed");
             ionic_set_error(ctx, err);
             IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "io_uring_queue_init failed flags=IORING_SETUP_SQPOLL res=%i (%s)", err.res, strerror(err.res));
@@ -114,7 +141,7 @@ static void ionic_iouring_engine_probe_ring(
 
     IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "ioring created flags=%u", params->flags);
 
-    struct io_uring_probe *probe = io_uring_get_probe_ring(&engine->ring);
+    struct io_uring_probe *probe = io_uring_get_probe_ring(&ring);
     if (!io_uring_opcode_supported(probe, IORING_OP_READ)) {
         struct ionic_error err = IONIC_ERR_WITH_MSG(IONIC_ERROR_UNSUPPORTED, "probe failed feature=IORING_OP_READ not supported");
         ionic_set_error(ctx, err);
@@ -130,19 +157,22 @@ static void ionic_iouring_engine_probe_ring(
     }
 
     io_uring_free_probe(probe);
-
-    ionic_iouring_engine_register_files(ctx, engine);
-    ionic_iouring_engine_register_buffers(ctx, engine);
 }
 
 struct ionic_iouring_engine *ionic_iouring_engine_create(struct ionic_context *ctx, struct ionic_iouring_engine_config *config) {
     if (ionic_has_error(&ctx->error)) goto ko;
     IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "create qd=%hu", config->qd);
 
-    struct ionic_iouring_engine *engine = malloc(sizeof(struct ionic_iouring_engine));
-    engine->config = *config;
+    ionic_iouring_engine_probe_ring(ctx, &config->params, config->qd);
+    if (ionic_has_error(&ctx->error)) goto ko;
 
-    ionic_iouring_engine_probe_ring(ctx, engine, &config->params, config->qd);
+    struct ionic_iouring_engine *engine = malloc(sizeof(struct ionic_iouring_engine));
+    engine->config          = *config;
+    engine->base.initialize = ionic_iouring_engine_init;
+    engine->base.destroy    = ionic_iouring_engine_destroy;
+    engine->base.submit     = ionic_iouring_engine_submit;
+    engine->base.can_submit = ionic_iouring_engine_can_submit;
+
     return engine;
 ko:
     return NULL;

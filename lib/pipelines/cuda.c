@@ -1,13 +1,36 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <ionic/engine.h>
 #include <ionic/pipelines/cuda.h>
 #include <ionic/logging.h>
-#include <stdlib.h>
-
 #include "ionic/utils.h"
 
 #ifdef __linux__
 #include <ionic/platform/linux/iouring.h>
 #endif
+
+static void ionic_pipeline_cuda_allocate_plan_memory(
+    struct ionic_context *ctx, const struct ionic_pipeline_cuda *pipeline, const struct ionic_sharding_plan *plan, unsigned short rank) {
+
+    size_t total = 0;
+    for (unsigned i = 0; i < plan->n; ++i) {
+        const struct ionic_sharded_tensor target = plan->tensors[i];
+        const size_t nbytes = ionic_tensor_nbytes(target.tensor);
+
+        if ((target.specs->dst = ctx->dalloc.allocate(ctx, nbytes, IONIC_ALLOC_DEVICE)) == NULL) {
+            ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+            IONIC_ERROR(&ctx->logger, pipeline->tag, "destination memory allocation failed");
+
+            //todo(mfuntowicz): clean memory
+            return;
+        }
+
+        total += nbytes;
+    }
+
+    IONIC_DEBUG(&ctx->logger, pipeline->tag,
+        "allocated destinations memory n=%zu, size=%zu (%.4f GiB)", plan->n, total, (float)total / 1024.0 / 1024.0 / 1024.0);
+}
 
 static void *ionic_pipeline_probe_ioengine(struct ionic_context *ctx, struct ionic_pipeline *pipeline)
 {
@@ -46,6 +69,12 @@ static void ionic_pipeline_cuda_destroy(struct ionic_pipeline *pipeline) {
         free(pipeline_->streams);
         pipeline_->streams = NULL;
     }
+
+    if (pipeline_->ioengine) {
+        pipeline_->ioengine->destroy(pipeline_->ioengine);
+        pipeline_->ioengine = NULL;
+    }
+    //todo(mfuntowicz) free ioengine memory
 }
 
 static void ionic_pipeline_cuda_initialize(struct ionic_context *ctx, struct ionic_pipeline *pipeline) {
@@ -112,23 +141,37 @@ ko:
     ionic_pipeline_cuda_destroy(&pipeline_->base);
 }
 
+static void ionic_pipeline_cuda_scheduler_loop(
+    struct ionic_context *ctx, const struct ionic_pipeline_cuda *pipeline, const struct ionic_sharding_plan *plan, const unsigned short rank) {
+
+    struct ionic_io_uring_engine *ioengine = (struct ionic_io_uring_engine *)pipeline->ioengine;
+
+    size_t done = 0;
+    while (done < plan->n) {
+        while (ionic_ioengine_can_submit(ctx, pipeline->ioengine)) {
+
+        }
+
+        ionic_ioengine_poll(ctx, pipeline->ioengine);
+
+        ++done;
+        IONIC_DEBUG(&ctx->logger, pipeline->tag, "tensor ack done=%zu", done);
+    }
+}
+
 static void ionic_pipeline_cuda_execute(
-    struct ionic_context *ctx, struct ionic_pipeline *pipeline, const struct ionic_sharding_plan *plan, unsigned short rank) {
+    struct ionic_context *ctx, struct ionic_pipeline *pipeline, const struct ionic_sharding_plan *plan, const unsigned short rank) {
+
     if (ionic_has_error(&ctx->error)) return;
 
-    struct ionic_pipeline_cuda *pipeline_ = (struct ionic_pipeline_cuda *)pipeline;
-    IONIC_INFO(&ctx->logger, pipeline_->tag, "execute rank=%hu", rank);
+    const struct ionic_pipeline_cuda *pipeline_ = (struct ionic_pipeline_cuda *)pipeline;
 
-    for (unsigned i = 0; i < plan->n; ++i) {
-        const struct ionic_sharded_tensor target = plan->tensors[i];
-        const size_t nbytes = ionic_tensor_nbytes(target.tensor);
+    ionic_pipeline_cuda_allocate_plan_memory(ctx, pipeline_, plan, rank);
+    if (ionic_has_error(&ctx->error)) return;
 
-        if ((target.specs->dst = ctx->dalloc.allocate(ctx, nbytes, IONIC_ALLOC_DEVICE)) == NULL) {
-            ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
-            IONIC_ERROR(&ctx->logger, pipeline_->tag, "destination memory allocation failed");
-            return;
-        }
-    }
+    IONIC_INFO(&ctx->logger, pipeline_->tag, "execute rank=%hu, n=%zu", rank, plan->n);
+
+    ionic_pipeline_cuda_scheduler_loop(ctx, pipeline_, plan, rank);
 }
 
 struct ionic_pipeline *ionic_pipeline_cuda_create(struct ionic_context *ctx, unsigned short world_size) {

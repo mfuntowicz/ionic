@@ -24,6 +24,7 @@ set(IONIC_SOURCES
 set(IONIC_HEADERS 
     include/ionic/ionic.h 
     include/ionic/types.h
+    include/ionic/engine.h
     include/ionic/error.h
     include/ionic/file.h
     include/ionic/logging.h
