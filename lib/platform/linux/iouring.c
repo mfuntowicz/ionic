@@ -1,7 +1,9 @@
 #include <ionic/platform/linux/iouring.h>
 
 #include <stdlib.h>
-#include <sys/mman.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <ionic/utils.h>
 
 #define IONIC_EVENT_TAG_IOENGINE_IOURING "ioengine(iouring)"
 
@@ -25,7 +27,8 @@ static void ionic_iouring_engine_register_files(struct ionic_context *ctx, struc
             int fd = open(file, O_RDONLY| O_DIRECT);
             if (fd < 0) {
                 struct ionic_error err = IONIC_SYS_ERR_WITH_MSG(-fd, "open failed");
-                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "open failed path=%s, res=%u", file, -fd);
+                ionic_set_error(ctx, err);
+                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "open failed path=%s, res=%u (%s)", file, err.res, strerror(err.res));
                 goto ko;
             }
             fds[i] = fd;
@@ -44,15 +47,9 @@ static void ionic_iouring_engine_register_buffers(struct ionic_context *ctx, str
     const struct ionic_iouring_engine_config *config = &engine->config;
     IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "registering staging buffers n=%u, size=%ukiB", config->qd, 2 * 1024);
 
-    if (config->qd % 2 != 0) {
+    if (!ionic_is_power_of_two(config->qd)) {
         IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "invalid queue depth value %hu, needs to be power of two", config->qd);
         ionic_set_error(ctx, IONIC_ERR_WITH_MSG(IONIC_ERROR_INVALID_VALUE, "qd needs to be power of two"));
-        return;
-    }
-
-    struct iovec *iovecs = calloc(config->qd, sizeof(struct iovec));
-    if (!iovecs) {
-        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
         return;
     }
 
@@ -60,47 +57,42 @@ static void ionic_iouring_engine_register_buffers(struct ionic_context *ctx, str
     void *base = ctx->dalloc.allocate(ctx, config->qd * 2 * 1024 * 1024, IONIC_ALLOC_STAGING);
     if (!base) goto ko; // error set by ctx->dalloc.allocate
 
-    // register the buffer ring to work along with IORING_OP_PROVIDE_BUFFERS
-    struct io_uring_buf_ring *bring = mmap(NULL, sizeof(struct io_uring_buf_ring), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (bring == MAP_FAILED) goto ko;
-
-    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "allocated io_uring_buf_ring ptr=%p", bring);
-
-    struct io_uring_buf_reg breg = {
-        .ring_addr    = (__u64)bring,
-        .ring_entries = config->qd,
-        .bgid         = ctx->device.ordinal,  // buffer group id — you pick this
-    };
-
-    io_uring_buf_ring_init(bring);
-    int res = io_uring_register_buf_ring(&engine->ring, &breg, 0);
-    if (res < 0) {
-        struct ionic_error err = IONIC_SYS_ERR_WITH_MSG(-res, "io_uring_register_buf_ring failed");
-        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "%s res=%u", err.what, -res);
-        ionic_set_error(ctx, err);
-        goto ko_munmap;
+    engine->iovecs = calloc(config->qd, sizeof(struct iovec));
+    if (!engine->iovecs) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+        return;
     }
 
-    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "registered io_uring_buf_ring ptr=%p", bring);
-
-    int mask = io_uring_buf_ring_mask(config->qd);
     for (unsigned i = 0; i < config->qd; ++i) {
-        iovecs[i].iov_base = base + i * 2 * 1024 * 1024;
-        iovecs[i].iov_len  = 2 * 1024 * 1024;
-        io_uring_buf_ring_add(bring, iovecs[i].iov_base, iovecs[i].iov_len, i, mask, i);
+        engine->iovecs[i].iov_base = base + i * 2 * 1024 * 1024; //todo(mfuntowicz): configure with env variable
+        engine->iovecs[i].iov_len  = 2 * 1024 * 1024;
     }
 
-    io_uring_buf_ring_advance(bring, config->qd); // commit all at once
-    engine->iovecs = iovecs;
-    engine->bring  = bring;
+    int res = 0;
+    if ((res = io_uring_register_buffers(&engine->ring, engine->iovecs, engine->config.qd))) {
+        struct ionic_error err = IONIC_SYS_ERR_WITH_MSG(-res, "io_uring_register_buffers failed");
+        ionic_set_error(ctx, err);
+
+        // RLIMIT_MEMLOCK advise
+        if (err.res == ENOMEM) {
+            struct rlimit rl;
+            getrlimit(RLIMIT_MEMLOCK, &rl);
+            IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING,
+                "io_uring_register_buffers failed with ENOMEM (12) is certainly related to RLIMIT_MEMLOCK set too low "
+                "(cur=%lu max=%lu, needed=%zu bytes)", rl.rlim_cur, rl.rlim_max, (size_t)engine->config.qd * 2 * 1024 * 1024
+            );
+        }
+
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "%s, res=%i (%s)", err.what, err.res, strerror(err.res));
+        goto ko;
+    }
 
     IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "registered staging buffers n=%u, size=%ukiB", config->qd, 2 * 1024);
     return;
 
-ko_munmap:
-    munmap(bring, sizeof(struct io_uring_buf_ring));
 ko:
-    free(iovecs);
+    if (engine->iovecs) free(engine->iovecs);
+    if (base) ctx->dalloc.free(ctx, base, IONIC_ALLOC_STAGING);
 }
 
 static void ionic_iouring_engine_probe_ring(
@@ -108,13 +100,14 @@ static void ionic_iouring_engine_probe_ring(
     int res = 0;
 
     params->flags |= IORING_SETUP_SQPOLL | IORING_SETUP_IOPOLL;
-    if ((res = io_uring_queue_init_params(qd, &engine->ring, params)) < 0) {
-        IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "io_uring_queue_init failed flags=IORING_SETUP_SQPOLL|IORING_SETUP_IOPOLL (res=%i)", -res);
+    if ((res = io_uring_queue_init_params(qd, &engine->ring, params))) {
+        IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "io_uring_queue_init failed flags=IORING_SETUP_SQPOLL|IORING_SETUP_IOPOLL res=%i (%s)", -res, strerror(-res));
 
         params->flags = IORING_SETUP_SQPOLL;
-        if ((res = io_uring_queue_init_params(qd, &engine->ring, params)) < 0) {
-            IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "io_uring_queue_init failed flags=IORING_SETUP_SQPOLL (res=%i)", -res);
-            ionic_set_error(ctx, IONIC_SYS_ERR(-res));
+        if ((res = io_uring_queue_init_params(qd, &engine->ring, params))) {
+            struct ionic_error err = IONIC_SYS_ERR_WITH_MSG(-res, "io_uring_queue_init_params failed");
+            ionic_set_error(ctx, err);
+            IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "io_uring_queue_init failed flags=IORING_SETUP_SQPOLL res=%i (%s)", err.res, strerror(err.res));
             return;
         }
     }
@@ -122,10 +115,17 @@ static void ionic_iouring_engine_probe_ring(
     IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "ioring created flags=%u", params->flags);
 
     struct io_uring_probe *probe = io_uring_get_probe_ring(&engine->ring);
-    if (!io_uring_opcode_supported(probe, IORING_OP_PROVIDE_BUFFERS)) {
-        struct ionic_error err = IONIC_ERR_WITH_MSG(IONIC_ERROR_UNSUPPORTED, "probe failed feature=IORING_OP_PROVIDE_BUFFERS not supported");
-        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, err.what);
+    if (!io_uring_opcode_supported(probe, IORING_OP_READ)) {
+        struct ionic_error err = IONIC_ERR_WITH_MSG(IONIC_ERROR_UNSUPPORTED, "probe failed feature=IORING_OP_READ not supported");
         ionic_set_error(ctx, err);
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, err.what);
+        return;
+    }
+
+    if (!io_uring_opcode_supported(probe, IORING_OP_READ_FIXED)) {
+        struct ionic_error err = IONIC_ERR_WITH_MSG(IONIC_ERROR_UNSUPPORTED, "probe failed feature=IORING_OP_READ_FIXED not supported");
+        ionic_set_error(ctx, err);
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, err.what);
         return;
     }
 
