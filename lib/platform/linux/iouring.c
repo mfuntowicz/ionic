@@ -175,6 +175,7 @@ static void ionic_iouring_engine_init(struct ionic_context *ctx, struct ionic_io
     engine_->slots[0] = SLOT_ALL_AVAILABLE;
     engine_->slots[1] = SLOT_ALL_AVAILABLE;
 
+    io_uring_queue_init_params(engine_->config.qd, &engine_->ring, &engine_->config.params);
     ionic_iouring_engine_register_files(ctx, engine_);
     ionic_iouring_engine_register_buffers(ctx, engine_);
 
