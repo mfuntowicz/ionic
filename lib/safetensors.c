@@ -317,7 +317,6 @@ static size_t ionic_safetensors_discover_tensors_from_index(
 
         offset += ionic_safetensors_discover_tensors_from_file(ctx, registry, shard_path, offset, fi);
         free(shard_path);
-        free(registry->files[fi]);
 
         if (ionic_has_error(&ctx->error))
             break;
