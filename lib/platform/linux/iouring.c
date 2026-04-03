@@ -66,6 +66,10 @@ static void ionic_iouring_engine_register_buffers(struct ionic_context *ctx, str
     for (unsigned i = 0; i < config->qd; ++i) {
         engine->iovecs[i].iov_base = base + i * 2 * 1024 * 1024; //todo(mfuntowicz): configure with env variable
         engine->iovecs[i].iov_len  = 2 * 1024 * 1024;
+    if (((uintptr_t)base & 0xFF) != 0) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_NOT_ALIGNED));
+        goto ko;
+    }
     }
 
     int res = 0;
