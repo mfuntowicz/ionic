@@ -10,35 +10,37 @@
 #define SLOT_UNAVAILABLE 0
 #define SLOT_ALL_AVAILABLE ULONG_MAX
 
-struct ionic_iouring_engine_slots {
-
-};
 
 struct ionic_iouring_engine_config {
     struct io_uring_params params;
     const char *files;
     unsigned n_files;
     unsigned qd;
+    size_t   st_size;
 };
 
 struct ionic_iouring_engine {
     struct ionic_ioengine base;
     struct io_uring ring;
     struct ionic_iouring_engine_config config;
-    struct io_uring_buf_ring *bring;
     struct iovec *iovecs;
     unsigned long slots[2];
     int fds;
 };
 
 
-static inline unsigned char ionic_iouring_engine_has_free_slot(const unsigned long slots) {
+static inline unsigned char has_free_slot(const unsigned long slots) {
     return slots != SLOT_UNAVAILABLE;
 }
 
-static inline int ionic_iouring_engine_get_slot(const unsigned long slots[2]) {
+static inline int get_available_slot(const unsigned long slots[2]) {
     const unsigned long mask = slots[0] | slots[1];
     return __builtin_ctzl(mask | (~mask + 1)) ^ (mask == 0);   // todo(mfuntowicz): limit to the actual queue depth
+}
+
+static inline void set_slot_busy(unsigned long slots[2], const size_t i) {
+    unsigned s = i % (sizeof(unsigned long) * 8);
+    slots[s] |= 1 << i;
 }
 
 struct ionic_iouring_engine *ionic_iouring_engine_create(struct ionic_context *ctx, struct ionic_iouring_engine_config *config);

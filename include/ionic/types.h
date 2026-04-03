@@ -33,8 +33,8 @@ typedef enum ionic_device_kind {
 } ionic_device_kind_t;
 
 static const char *IONIC_DEVICE_LITERAL[] = {
-    [IONIC_DEVICE_CPU] = "CPU",
-    [IONIC_DEVICE_CUDA] = "CUDA"
+    [IONIC_DEVICE_CPU] = "cpu",
+    [IONIC_DEVICE_CUDA] = "cuda"
 };
 
 typedef struct ionic_device {

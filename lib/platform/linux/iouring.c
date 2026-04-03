@@ -174,7 +174,6 @@ struct ionic_iouring_engine *ionic_iouring_engine_create(struct ionic_context *c
     engine->base.initialize = ionic_iouring_engine_init;
     engine->base.destroy    = ionic_iouring_engine_destroy;
     engine->base.fetch      = ionic_iouring_engine_fetch;
-    engine->base.peek       = NULL;
 
     return engine;
 ko:
