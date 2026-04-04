@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 #include <sys/resource.h>
 #include <ionic/utils.h>
 
@@ -104,7 +105,7 @@ ko:
 static size_t ionic_iouring_engine_get_sqe_chunks(
     struct ionic_context *ctx, 
     struct ionic_iouring_engine *engine, 
-    struct ionic_io_fragment *segments, 
+    struct ionic_io_file_segment *segments,
     unsigned count,
     struct ionic_io_fetch_result **results) 
 {
@@ -132,7 +133,7 @@ static size_t ionic_iouring_engine_get_sqe_chunks(
 
     size_t chunk_idx = 0;
     for (unsigned seg_idx = 0; seg_idx < count; ++seg_idx) {
-        const struct ionic_io_fragment *seg = &segments[seg_idx];
+        const struct ionic_io_file_segment *seg = &segments[seg_idx];
         size_t aligned_from = ionic_align_down_sz(seg->from, 4096);
         size_t aligned_to = ionic_align_up_sz(seg->to, 4096);
         
@@ -144,12 +145,12 @@ static size_t ionic_iouring_engine_get_sqe_chunks(
             }
 
             struct ionic_io_fetch_result *result = &(*results)[chunk_idx];
-            result->fragment.from = offset;
-            result->fragment.to = chunk_end;
+            result->fragment.file.from = offset;
+            result->fragment.file.to = chunk_end;
+            result->fragment.file.path = seg->path;
             result->fragment.len = chunk_end - offset;
-            result->fragment.path = seg->path;
             result->fragment.data = NULL;
-            result->userdata = seg->data;
+            result->userdata = NULL;
             
             offset = chunk_end;
             chunk_idx++;
@@ -183,7 +184,7 @@ static void ionic_iouring_engine_init(struct ionic_context *ctx, struct ionic_io
 }
 
 static size_t ionic_iouring_engine_fetch(
-    struct ionic_context *ctx, struct ionic_ioengine *engine, struct ionic_io_fragment *segments, const unsigned count) {
+    struct ionic_context *ctx, struct ionic_ioengine *engine, struct ionic_io_file_segment *segments, const unsigned count) {
 
     if (ionic_has_error(&ctx->error)) return 0;
 
@@ -192,6 +193,35 @@ static size_t ionic_iouring_engine_fetch(
     size_t n_chunks = ionic_iouring_engine_get_sqe_chunks(ctx, engine_, segments, count, &results);
 
     IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "fetch segments=%u, chunks=%zu", count, n_chunks);
+
+    unsigned long (*slots)[2] = &engine_->slots;
+    struct iovec *iovecs = engine_->iovecs;
+    struct io_uring *ring = &engine_->ring;
+    struct io_uring_cqe *ready[engine_->config.qd];
+
+    for (size_t c = 0; c < n_chunks; ++c) {
+        int slot = -1;
+         while ((slot = get_available_slot(slots)) >= 0) {
+             set_slot_busy(slots, slot);
+
+             int fd = engine_->fds;
+             struct iovec dst = iovecs[slot];
+             struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+             struct ionic_io_fragment fragment = results[c].fragment;
+             io_uring_prep_read_fixed(sqe, 0, dst.iov_base, fragment.len, 0, slot);
+             io_uring_submit(ring);
+         }
+
+        unsigned n_ready = io_uring_peek_batch_cqe(ring, ready, engine_->config.qd);
+        if (n_ready < 1) continue;
+
+        for (size_t r = 0; r < n_ready; ++r) {
+            struct io_uring_cqe *cqe = ready[r];
+            io_uring_cqe_seen(ring, cqe);
+
+            ready[r] = NULL;
+        }
+    }
 
     if (results) free(results);
     return count;

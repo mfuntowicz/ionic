@@ -56,11 +56,12 @@ size_t ionic_pipeline_execute(struct ionic_context *ctx, struct ionic_pipeline *
 
     IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "executing plan n=%zu", plan->n);
 
+    if (pipeline->plan != plan)
+        pipeline->plan = plan;
+
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC_COARSE, &start);
-
     pipeline->execute(ctx, pipeline, plan, rank);
-
     clock_gettime(CLOCK_MONOTONIC_COARSE, &end);
     double duration = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "executed plan n=%zu, duration=%.6fs", plan->n, duration);

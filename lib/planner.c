@@ -83,7 +83,6 @@ void ionic_planner_shard(ionic_context_t *ctx, ionic_planner_t *planner, const s
 ionic_sharding_plan_t ionic_planner_materialize_plan(ionic_context_t *ctx, ionic_planner_t *planner)
 {
     ionic_sharding_plan_t out = {0};
-
     if (ionic_has_error(&ctx->error)) return out;
 
     if(!planner || planner->n_registered != planner->n) {
@@ -108,6 +107,7 @@ ionic_sharding_plan_t ionic_planner_materialize_plan(ionic_context_t *ctx, ionic
         }
 
         out.tensors[i] = shard;
+        out.world_size = planner->world_size;
         out.n++;
     }
     return out;

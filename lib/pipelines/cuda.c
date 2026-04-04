@@ -1,5 +1,7 @@
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <threads.h>
 #include <ionic/engine.h>
 #include <ionic/pipelines/cuda.h>
 #include <ionic/logging.h>
@@ -37,7 +39,7 @@ static void *ionic_pipeline_probe_ioengine(struct ionic_context *ctx, struct ion
     struct ionic_pipeline_cuda *pipeline_ = (struct ionic_pipeline_cuda *)pipeline;
     IONIC_TRACE(&ctx->logger, pipeline_->tag, "probing ioengine");
 #ifdef __linux__
-    struct ionic_iouring_engine_config p = { .qd = 32 };
+    struct ionic_iouring_engine_config p = { .qd = 32, .st_size = 2 * 1024 * 1024 }; // todo(mfuntowicz): move to iouring + override with envvar
     return ionic_iouring_engine_create(ctx, &p);
 #else
     ionic_set_error(ctx, IONIC_ERR_WITH_MSG(IONIC_ERROR_UNSUPPORTED, "platform not supported yet."))
@@ -144,8 +146,9 @@ static void ionic_pipeline_cuda_initialize(struct ionic_context *ctx, struct ion
         goto ko;
     }
 
+    ionic_ioengine_initialize(ctx, ioengine);
     pipeline_->ioengine = ioengine;
-    IONIC_TRACE(&ctx->logger, pipeline_->tag, "initialized concurrency=%hhu, coalesced_read_threshold=%zu", 
+    IONIC_TRACE(&ctx->logger, pipeline_->tag, "initialized concurrency=%hhu, threshold=%zu",
         pipeline_->concurrency, pipeline_->threshold);
     return;
 
@@ -153,110 +156,89 @@ ko:
     ionic_pipeline_cuda_destroy(&pipeline_->base);
 }
 
+struct ionic_io_file_segment *ionic_pipeline_cuda_fragments_from_files(
+    struct ionic_context *ctx, const struct ionic_pipeline_cuda *pipeline, unsigned short rank) {
+    IONIC_TRACE(&ctx->logger, pipeline->tag, "computing fragments files=%zu, rank=%hu", pipeline->base.n_files, rank);
 
-static size_t ionic_io_engine_compute_coalesced_reads(
-    struct ionic_context *ctx, 
-    struct ionic_io_fragment **fragments, 
-    const struct ionic_pipeline_cuda *pipeline, 
-    const struct ionic_sharding_plan *plan, 
-    const unsigned short rank)
-{
-    if (plan->n == 0) {
-        *fragments = NULL;
-        return 0;
-    }
+    const struct ionic_sharding_plan *plan = pipeline->base.plan;
 
-    *fragments = calloc(pipeline->base.n_files, sizeof(struct ionic_io_fragment));
-    if (!*fragments) {
-        ionic_set_error(ctx, IONIC_ERR_WITH_MSG(IONIC_ERROR_ALLOCATION_FAILED, "failed to allocate coalesced reads fragments"));
-        return 0;
-    }
-    size_t n_fragments = 0;
+    size_t n_files = pipeline->base.n_files;
+    imaxdiv_t n_files_per_rank = imaxdiv((intmax_t)n_files, (intmax_t)plan->world_size);
+    size_t n_files_for_rank = n_files_per_rank.quot;
 
-    size_t *file_min_from = calloc(pipeline->base.n_files, sizeof(size_t));
-    size_t *file_max_to = calloc(pipeline->base.n_files, sizeof(size_t));
-    void **file_first_data = calloc(pipeline->base.n_files, sizeof(void *));
-    
-    if (!file_min_from || !file_max_to || !file_first_data) {
+    if (n_files_per_rank.rem > 0 && rank < n_files_per_rank.rem)
+        n_files_for_rank += 1;
+
+    struct ionic_io_file_segment *segments = calloc(n_files_for_rank, sizeof(struct ionic_io_file_segment));
+    if (!segments) {
         ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
-        goto ko;
+        IONIC_ERROR(&ctx->logger, pipeline->tag, "fragments allocation failed n_files=%zu", n_files);
+        goto exit;
     }
 
-    for (size_t f = 0; f < pipeline->base.n_files; ++f) {
-        file_min_from[f] = SIZE_MAX;
-        file_max_to[f] = 0;
-        file_first_data[f] = NULL;
-    }
+    for (size_t i = 0; i < n_files_for_rank; ++i) {
+        const size_t idx = i * plan->world_size + rank;
+        const char *f = pipeline->base.files[idx];
+        const unsigned short location = pipeline->base.locations[idx];
 
-    for (size_t i = 0; i < plan->n; ++i) {
-        const struct ionic_sharded_tensor target = plan->tensors[i];
-        const struct ionic_tensor *tensor = target.tensor;
-        const struct ionic_sharded_tensor_specs *specs = &target.specs[rank];
-
-        const size_t from = tensor->start + specs->start;
-        const size_t to = tensor->start + specs->end;
-        const unsigned short fidx = pipeline->base.locations[i];
-
-        if (from < file_min_from[fidx]) {
-            file_min_from[fidx] = from;
-            file_first_data[fidx] = specs->dst;
+        // look for the start/end of all the tensors in the file
+        size_t from = SIZE_MAX, to = -SIZE_MAX;
+        for (size_t j = 0; j < plan->n; ++j) {
+            const struct ionic_tensor *t = plan->tensors[j].tensor;
+            if (t->file == location && t->start < from) from = t->start;
+            if (t->file == location && t->end > to) to = t->end;
         }
 
-        if (to > file_max_to[fidx])
-            file_max_to[fidx] = to;
+        segments[i].path = f;
+        segments[i].from = from;
+        segments[i].to   = to;
     }
 
-    for (size_t f = 0; f < pipeline->base.n_files; ++f) {
-        if (file_min_from[f] != SIZE_MAX) {
-            (*fragments)[n_fragments].path = pipeline->base.files[f];
-            (*fragments)[n_fragments].from = file_min_from[f];
-            (*fragments)[n_fragments].to = file_max_to[f];
-            (*fragments)[n_fragments].len = file_max_to[f] - file_min_from[f];
-            (*fragments)[n_fragments].data = file_first_data[f];
-            n_fragments++;
-        }
-    }
-
-    if (n_fragments < pipeline->base.n_files) {
-        struct ionic_io_fragment *tmp = realloc(*fragments, n_fragments * sizeof(struct ionic_io_fragment));
-        if (tmp) *fragments = tmp;
-    }
-
-    goto cleanup;
-
-ko:
-    free(*fragments);
-    *fragments = NULL;
-
-cleanup:
-    free(file_min_from);
-    free(file_max_to);
-    free(file_first_data);
-
-    return n_fragments;
+exit:
+    return segments;
 }
 
-static void ionic_pipeline_cuda_scheduler_loop(
-    struct ionic_context *ctx, const struct ionic_pipeline_cuda *pipeline, const struct ionic_sharding_plan *plan, const unsigned short rank){
-    if (ionic_has_error(&ctx->error)) return;
+struct dma_worker_params {
+    struct ionic_context *ctx;
+    struct ionic_ioengine *engine;
+    atomic_uchar running;
+};
 
-    struct ionic_io_fragment *reads;
-    const size_t n_reads = ionic_io_engine_compute_coalesced_reads(ctx, &reads, pipeline, plan, rank);
+static void ionic_pipeline_cuda_dma_worker(const struct dma_worker_params *params) {
+    char tag[32];
+    const struct ionic_context *ctx = params->ctx;
+    snprintf(tag, sizeof(tag), "dma_worker(%s:%u)", IONIC_DEVICE_LITERAL[ctx->device.kind], ctx->device.ordinal);
+    IONIC_INFO(&params->ctx->logger, tag, "started");
 
-    if (n_reads > 0) {
-        ionic_ioengine_fetch(ctx, pipeline->ioengine, reads, n_reads);
-
-        size_t n_done = 0;
-        while (n_done < plan->n) {
-            // unsigned count = ionic_ioengine_peek(ctx, pipeline->ioengine, &fragments, num_fragments);
-            // if (count < 0) return;
-        }
-    } else {
-        if (!ionic_has_error(&ctx->error))
-            IONIC_WARN(&ctx->logger, pipeline->tag, "got empty read fragments list");
+    while(atomic_load_explicit(&params->running, memory_order_acquire)) {
+        thrd_yield();
     }
 
-    free(reads);
+    IONIC_INFO(&params->ctx->logger, tag, "exited");
+}
+
+static size_t ionic_pipeline_cuda_scheduler_loop(
+    struct ionic_context *ctx, const struct ionic_pipeline_cuda *pipeline, const struct ionic_sharding_plan *plan, const unsigned short rank){
+    if (ionic_has_error(&ctx->error)) return 0;
+
+    thrd_t dma_worker;
+    struct dma_worker_params dma_params = { .ctx = ctx, .engine = pipeline->ioengine, .running = 1 };
+    int dma_worker_status = thrd_create(&dma_worker, (thrd_start_t)ionic_pipeline_cuda_dma_worker, &dma_params);
+    if (dma_worker_status != 0) {
+        IONIC_ERROR(&ctx->logger, pipeline->tag, "dma_worker thread launch failed res=%i", dma_worker_status);
+        ionic_set_error(ctx, IONIC_SYS_ERR_WITH_MSG(-dma_worker_status, "dma_worker thread launch failed"));
+        return 0;
+    }
+
+    struct ionic_io_file_segment *segments = ionic_pipeline_cuda_fragments_from_files(ctx, pipeline, rank);
+    size_t n = ionic_ioengine_fetch(ctx, pipeline->ioengine, segments, pipeline->base.n_files);
+    atomic_store_explicit(&dma_params.running, 0, memory_order_release);
+
+    int status = 0;
+    thrd_join(dma_worker, &status);
+
+    if (segments) free(segments);
+    return n;
 }
 
 static void ionic_pipeline_cuda_execute(struct ionic_context *ctx, struct ionic_pipeline *pipeline, const struct ionic_sharding_plan *plan, const unsigned short rank) {
