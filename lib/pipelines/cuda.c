@@ -39,7 +39,7 @@ static void *ionic_pipeline_probe_ioengine(struct ionic_context *ctx, struct ion
     struct ionic_pipeline_cuda *pipeline_ = (struct ionic_pipeline_cuda *)pipeline;
     IONIC_TRACE(&ctx->logger, pipeline_->tag, "probing ioengine");
 #ifdef __linux__
-    struct ionic_iouring_engine_config p = { .qd = 32, .st_size = 2 * 1024 * 1024 }; // todo(mfuntowicz): move to iouring + override with envvar
+    struct ionic_iouring_engine_config p = { .qd = 32, .st_size = 2 * 1024 * 1024, .files = pipeline->files, .n_files = pipeline->n_files}; // todo(mfuntowicz): move to iouring + override with envvar
     return ionic_iouring_engine_create(ctx, &p);
 #else
     ionic_set_error(ctx, IONIC_ERR_WITH_MSG(IONIC_ERROR_UNSUPPORTED, "platform not supported yet."))

@@ -10,10 +10,15 @@
 #define SLOT_UNAVAILABLE 0
 #define SLOT_ALL_AVAILABLE ULONG_MAX
 
+struct ionic_iouring_registered_file {
+    const char *path;
+    int fd;
+};
+
 
 struct ionic_iouring_engine_config {
     struct io_uring_params params;
-    const char *files;
+    const char **files;
     unsigned n_files;
     unsigned qd;
     size_t   st_size;
@@ -25,7 +30,7 @@ struct ionic_iouring_engine {
     struct ionic_iouring_engine_config config;
     struct iovec *iovecs;
     unsigned long slots[2];
-    int fds;
+    struct ionic_iouring_registered_file *files;
 };
 
 

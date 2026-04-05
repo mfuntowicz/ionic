@@ -8,6 +8,14 @@
 
 #define IONIC_EVENT_TAG_IOENGINE_IOURING "ioengine(iouring)"
 
+static struct ionic_iouring_registered_file *ionic_iouring_engine_find_registered_file(const struct ionic_iouring_engine *engine, const char *path) {
+    for (size_t i = 0; i < engine->config.n_files; ++i) {
+        if (strcmp(path, engine->files[i].path) == 0) return engine->files + i;
+    }
+
+    return NULL;
+}
+
 static void ionic_iouring_engine_register_files(struct ionic_context *ctx, struct ionic_iouring_engine *engine) {
     if (ionic_has_error(&ctx->error)) return;
 
@@ -17,27 +25,44 @@ static void ionic_iouring_engine_register_files(struct ionic_context *ctx, struc
     {
         IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "registering files=%u", config->n_files);
 
-        int *fds = calloc(config->n_files, sizeof(int));
-        if (!fds) {
+
+        struct ionic_iouring_registered_file *files = calloc(config->n_files, sizeof(struct ionic_iouring_registered_file));
+        int *fds = calloc(config->n_files, sizeof(struct ionic_iouring_registered_file));
+        if (!files || !fds) {
+            if (files) free(files);
+            if (fds) free(fds);
+
             ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
             return;
         }
 
         for (unsigned i = 0; i < config->n_files; ++i) {
-            const char *file = engine->config.files + i;
+            const char *file = engine->config.files[i];
             int fd = open(file, O_RDONLY| O_DIRECT);
             if (fd < 0) {
                 struct ionic_error err = IONIC_SYS_ERR_WITH_MSG(-fd, "open failed");
                 ionic_set_error(ctx, err);
-                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "open failed path=%s, res=%u (%s)", file, err.res, strerror(err.res));
+                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING,
+                    "open failed path=%s, res=%u (%s)", file, err.res, strerror(err.res));
                 goto ko;
             }
             fds[i] = fd;
+            files[i] = (struct ionic_iouring_registered_file) { file, fd };
             IONIC_TRACE(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "\t opened file %s, fd=%u", file, fd);
         }
 
-        io_uring_register_files(&engine->ring, fds, config->n_files);
+        int res = io_uring_register_files(&engine->ring, fds, config->n_files);
+        if (res < 0) {
+            struct ionic_error err = IONIC_SYS_ERR_WITH_MSG(res, "io_uring_register_files failed");
+            ionic_set_error(ctx, err);
+            IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING,
+                "io_uring_register_files failed res=%u (%s)", err.res, strerror(err.res));
+            goto ko;
+        }
+
+        engine->files = files;
 ko:
+        free(files);
         free(fds);
     }
 }
@@ -199,16 +224,26 @@ static size_t ionic_iouring_engine_fetch(
     struct io_uring *ring = &engine_->ring;
     struct io_uring_cqe *ready[engine_->config.qd];
 
-    for (size_t c = 0; c < n_chunks; ++c) {
-        int slot = -1;
+    for (size_t c = 0; c < n_chunks; ) {
+        int slot;
          while ((slot = get_available_slot(slots)) >= 0) {
              set_slot_busy(slots, slot);
 
-             int fd = engine_->fds;
+             struct ionic_io_fetch_result result = results[c];
+
+             // find corresponding register files
+             struct ionic_iouring_registered_file *file = ionic_iouring_engine_find_registered_file(engine_, result.fragment.file.path);
+             if (!file) {
+                 struct ionic_error err = IONIC_ERR_WITH_MSG(IONIC_ERROR_IOENGINE_INVALID_PARAMETER, "file not registered");
+                 ionic_set_error(ctx, err);
+                 return 0;
+             }
+
              struct iovec dst = iovecs[slot];
              struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-             struct ionic_io_fragment fragment = results[c].fragment;
-             io_uring_prep_read_fixed(sqe, 0, dst.iov_base, fragment.len, 0, slot);
+             struct ionic_io_fragment fragment = result.fragment;
+
+             io_uring_prep_read_fixed(sqe, file->fd, dst.iov_base, fragment.len, 0, slot);
              io_uring_submit(ring);
          }
 
