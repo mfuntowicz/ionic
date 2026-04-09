@@ -224,15 +224,16 @@ static size_t ionic_iouring_engine_fetch(
     struct io_uring *ring = &engine_->ring;
     struct io_uring_cqe *ready[engine_->config.qd];
 
-    for (size_t c = 0; c < n_chunks; ) {
+    size_t submitted = 0, done = 0;
+    do {
         int slot;
-         while ((slot = get_available_slot(slots)) >= 0) {
+         while (submitted < n_chunks && (slot = get_available_slot(slots)) >= 0) {
              set_slot_busy(slots, slot);
 
-             struct ionic_io_fetch_result result = results[c];
+             struct ionic_io_fetch_result res = results[submitted];
 
              // find corresponding register files
-             struct ionic_iouring_registered_file *file = ionic_iouring_engine_find_registered_file(engine_, result.fragment.file.path);
+             struct ionic_iouring_registered_file *file = ionic_iouring_engine_find_registered_file(engine_, res.fragment.file.path);
              if (!file) {
                  struct ionic_error err = IONIC_ERR_WITH_MSG(IONIC_ERROR_IOENGINE_INVALID_PARAMETER, "file not registered");
                  ionic_set_error(ctx, err);
@@ -241,10 +242,12 @@ static size_t ionic_iouring_engine_fetch(
 
              struct iovec dst = iovecs[slot];
              struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-             struct ionic_io_fragment fragment = result.fragment;
+             struct ionic_io_fragment fragment = res.fragment;
 
              io_uring_prep_read_fixed(sqe, file->fd, dst.iov_base, fragment.len, 0, slot);
              io_uring_submit(ring);
+
+             ++submitted;
          }
 
         unsigned n_ready = io_uring_peek_batch_cqe(ring, ready, engine_->config.qd);
@@ -253,13 +256,30 @@ static size_t ionic_iouring_engine_fetch(
         for (size_t r = 0; r < n_ready; ++r) {
             struct io_uring_cqe *cqe = ready[r];
             io_uring_cqe_seen(ring, cqe);
-
             ready[r] = NULL;
+
+            // todo(mfuntowicz) set the atomic indicating this slot need processing + store the cqe * (or only the slot id)
         }
-    }
+
+        if (engine_->done[0] > 0 || engine_->done[1] > 0) {
+            // todo(mfuntowicz) release each slot (put to 0) and mark the slot as available
+
+            ++done;
+        }
+
+    } while (done < n_chunks);
 
     if (results) free(results);
     return count;
+}
+
+static void ionic_iouring_engine_mark_done(struct ionic_ioengine *engine, struct ionic_io_fetch_result *res) {
+    struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
+    struct io_uring_cqe *cqe = res->userdata;
+    unsigned long (*done)[2] = &engine_->done;
+
+    ldiv_t pos = ldiv(cqe->user_data, sizeof(unsigned long));
+    done[pos.quot][pos.rem] = 1;
 }
 
 static void ionic_iouring_engine_probe_ring(struct ionic_context *ctx, struct io_uring_params *params, unsigned qd) {
@@ -311,6 +331,7 @@ struct ionic_iouring_engine *ionic_iouring_engine_create(struct ionic_context *c
     engine->base.initialize = ionic_iouring_engine_init;
     engine->base.destroy    = ionic_iouring_engine_destroy;
     engine->base.fetch      = ionic_iouring_engine_fetch;
+    engine->base.mark_done  = ionic_iouring_engine_mark_done;
 
     return engine;
 ko:

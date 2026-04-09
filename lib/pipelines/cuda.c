@@ -205,11 +205,14 @@ struct dma_worker_params {
 };
 
 static void ionic_pipeline_cuda_dma_worker(const struct dma_worker_params *params) {
+    const thrd_t self = thrd_current();
+
     char tag[32];
     const struct ionic_context *ctx = params->ctx;
-    snprintf(tag, sizeof(tag), "dma_worker(%s:%u)", IONIC_DEVICE_LITERAL[ctx->device.kind], ctx->device.ordinal);
-    IONIC_INFO(&params->ctx->logger, tag, "started");
+    snprintf(tag, sizeof(tag), "dma_worker[%lu](%s:%u)",
+        self, IONIC_DEVICE_LITERAL[ctx->device.kind], ctx->device.ordinal);
 
+    IONIC_INFO(&params->ctx->logger, tag, "started");
     while(atomic_load_explicit(&params->running, memory_order_acquire)) {
         thrd_yield();
     }

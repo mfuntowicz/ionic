@@ -22,6 +22,7 @@ struct ionic_io_fetch_result {
 
 struct ionic_ioengine {
     size_t(*fetch)(struct ionic_context *, struct ionic_ioengine *, struct ionic_io_file_segment *, unsigned);
+    void(*mark_done)(struct ionic_ioengine *, struct ionic_io_fetch_result *);
     void(*initialize)(struct ionic_context *, struct ionic_ioengine *);
     void(*destroy)(struct ionic_ioengine *);
 };

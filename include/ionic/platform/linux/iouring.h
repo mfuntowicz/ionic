@@ -30,6 +30,7 @@ struct ionic_iouring_engine {
     struct ionic_iouring_engine_config config;
     struct iovec *iovecs;
     unsigned long slots[2];
+    unsigned long done[2];
     struct ionic_iouring_registered_file *files;
 };
 
