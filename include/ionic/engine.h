@@ -7,6 +7,7 @@ struct ionic_io_file_segment {
     size_t from;
     size_t to;
     const char *path;
+    void *dst;
 };
 
 struct ionic_io_fragment {

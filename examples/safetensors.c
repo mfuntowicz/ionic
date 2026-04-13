@@ -1,6 +1,9 @@
 #include "ionic/pipeline.h"
 #include <errno.h>
+#include <execinfo.h>
+#include <signal.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <ionic/ionic.h>
 #include <ionic/safetensors.h>
 #include <stdlib.h>
@@ -10,8 +13,19 @@
 #include <ionic/planner.h>
 #endif
 
+static void crash_handler(int sig) {
+    void *buffer[100];
+    int n = backtrace(buffer, 100);
+    fprintf(stderr, "Got signal %d, backtrace:\n", sig);
+    backtrace_symbols_fd(buffer, n, STDERR_FILENO);
+    _exit(1);
+}
+
 int main(int argc, char **argv)
 {
+    signal(SIGSEGV, crash_handler);
+    signal(SIGFPE, crash_handler);
+    signal(SIGABRT, crash_handler);
     ionic_context_t ctx;
     ionic_safetensors_t registry;
     ionic_device_t device = ionic_cuda_device(0);
@@ -21,7 +35,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    int world_size = 0;
+    int world_size = 1;
     if(argc == 4 && strcmp(argv[2], "--world-size") == 0) {
         errno = 0;
         char *end;
@@ -36,8 +50,6 @@ int main(int argc, char **argv)
             fprintf(stderr, "Invalid world size %ul, should be >= 1", world_size);
             return 2;
         }
-    } else {
-        world_size = 1;
     }
 
     ionic_context_init(&ctx, device);
