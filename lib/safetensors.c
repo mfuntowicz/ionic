@@ -1,6 +1,7 @@
 #include "ionic/safetensors.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -291,15 +292,19 @@ static size_t ionic_safetensors_discover_tensors_from_index(
     yyjson_obj_foreach(weights, idx, max, key, val) {
         const char *file = yyjson_get_str(val);
         if (!file) continue;
+        size_t file_len = yyjson_get_len(val);
 
         size_t fi = 0;
         for (; fi < registry->n_files; fi++) {
-            if (strcmp(registry->files[fi], file) == 0)
+            const char *stored = registry->files[fi];
+            size_t stored_len = strlen(stored);
+            if (stored_len >= file_len && strcmp(stored + stored_len - file_len, file) == 0)
                 break;
         }
 
         if (fi == registry->n_files) {
-            registry->files[registry->n_files] = strndup(file, yyjson_get_len(val));
+            registry->files[registry->n_files] = ionic_path_join(workspace, workspace_len, file, file_len);
+            if (!registry->files[registry->n_files]) goto freeup;
             ++registry->n_files;
         }
     }
@@ -312,11 +317,7 @@ static size_t ionic_safetensors_discover_tensors_from_index(
 
     size_t offset = 0;
     for (size_t fi = 0; fi < registry->n_files; fi++) {
-        char *shard_path = ionic_path_join(workspace, workspace_len, registry->files[fi], strlen(registry->files[fi]));
-        if (!shard_path) goto freeup_files;
-
-        offset += ionic_safetensors_discover_tensors_from_file(ctx, registry, shard_path, offset, fi);
-        free(shard_path);
+        offset += ionic_safetensors_discover_tensors_from_file(ctx, registry, registry->files[fi], offset, fi);
 
         if (ionic_has_error(&ctx->error))
             break;
@@ -341,20 +342,29 @@ ko:
 size_t ionic_safetensors_discover_tensors(ionic_context_t *ctx, ionic_safetensors_t *registry, const char *path) {
     if(ionic_has_error(&ctx->error)) return 0;
 
-    // we first try to read the file as a JSON index file
     size_t n_tensors = 0;
     yyjson_doc *doc = yyjson_read_file(path, YYJSON_READ_NOFLAG, NULL, NULL);
     if(doc) {
         IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "index path=%s", path);
 
-        char cwd[4096];  // max path length
-        size_t length = ionic_path_parent(path, cwd, sizeof(cwd));
+        char resolved[PATH_MAX];
+        char *abs = realpath(path, resolved);
+        if (!abs) {
+            ionic_set_error(ctx, IONIC_SYS_ERR_WITH_MSG(errno, "realpath failed"));
+            yyjson_doc_free(doc);
+            return 0;
+        }
+
+        char parent[PATH_MAX];
+        size_t parent_len = ionic_path_parent(abs, parent, sizeof(parent));
         yyjson_val *root = yyjson_doc_get_root(doc);
-        n_tensors = ionic_safetensors_discover_tensors_from_index(ctx, registry, root, cwd, length);
+        n_tensors = ionic_safetensors_discover_tensors_from_index(ctx, registry, root, parent, parent_len);
 
         yyjson_doc_free(doc);
     } else {
-        n_tensors = ionic_safetensors_discover_tensors_from_file(ctx, registry, path, 0, 0);
+        char resolved[PATH_MAX];
+        char *abs = realpath(path, resolved);
+        n_tensors = ionic_safetensors_discover_tensors_from_file(ctx, registry, abs ? abs : path, 0, 0);
     }
 
     return n_tensors;
