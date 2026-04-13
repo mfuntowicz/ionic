@@ -68,7 +68,7 @@ int main(int argc, char **argv)
     struct ionic_sharding_plan plan = ionic_planner_materialize_plan(&ctx, planner);
     struct ionic_pipeline *pipeline = ionic_pipeline_probe(&ctx, world_size);
 
-    ionic_pipeline_init(&ctx, pipeline, registry.locations, registry.files, registry.n_tensors, registry.n_files);
+    ionic_pipeline_init(&ctx, pipeline, registry.files, registry.n_tensors, registry.n_files);
     size_t n = ionic_pipeline_execute(&ctx, pipeline, &plan, 0);
 
     ionic_planner_destroy(planner);

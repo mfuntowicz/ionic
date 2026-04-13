@@ -27,7 +27,6 @@ struct ionic_pipeline *ionic_pipeline_probe(struct ionic_context *ctx, unsigned 
 void ionic_pipeline_init(
     struct ionic_context *ctx,
     struct ionic_pipeline *pipeline,
-    const unsigned short *locations,
     char * const *files,
     size_t n_tensors,
     size_t n_files
@@ -35,7 +34,6 @@ void ionic_pipeline_init(
     if (ionic_has_error(&ctx->error)) return;
     if (!pipeline) return;
 
-    pipeline->locations = locations;
     pipeline->files = files;
     pipeline->n_tensors = n_tensors;
     pipeline->n_files = n_files;

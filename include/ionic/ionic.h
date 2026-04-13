@@ -106,7 +106,7 @@ IONIC_EXTERN void ionic_sharding_plan_destroy(struct ionic_context *, struct ion
  * ═══════════════════════════════════════════════════════════════════════════ */
 #include "pipeline.h"
 IONIC_EXTERN struct ionic_pipeline *ionic_pipeline_probe(struct ionic_context *, unsigned short world_size);
-IONIC_EXTERN void ionic_pipeline_init(struct ionic_context *, struct ionic_pipeline *, const unsigned short *, char * const *, size_t, size_t) NO_EXCEPT;
+IONIC_EXTERN void ionic_pipeline_init(struct ionic_context *, struct ionic_pipeline *, char * const *, size_t, size_t) NO_EXCEPT;
 IONIC_EXTERN void ionic_pipeline_destroy(struct ionic_pipeline *) NO_EXCEPT;
 IONIC_EXTERN size_t ionic_pipeline_execute(struct ionic_context *, struct ionic_pipeline *, const struct ionic_sharding_plan *, unsigned short rank) NO_EXCEPT;
 

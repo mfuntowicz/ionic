@@ -171,10 +171,11 @@ void ionic_safetensors_destroy(ionic_safetensors_t *registry) {
 }
 
 static size_t ionic_safetensors_extract_registry(
-    struct ionic_context *ctx, struct ionic_safetensors *registry, yyjson_val *const root, size_t offset, unsigned short file) {
+    struct ionic_context *ctx, struct ionic_safetensors *registry, yyjson_val *const root, const size_t offset, const char *file)
+{
     if(ionic_has_error(&ctx->error) || !root) goto ko;
 
-    size_t n = yyjson_obj_size(root);
+    const size_t n = yyjson_obj_size(root);
     IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "discovery tensors=%zu", n);
 
     // if coming from an index file, we preallocate the tensors and names arrays across all the files
@@ -209,8 +210,9 @@ static size_t ionic_safetensors_extract_registry(
 
         tensor->start += registry->hdr_size + sizeof(registry->hdr_size);
         tensor->end += registry->hdr_size + sizeof(registry->hdr_size);
+        tensor->file = file;
         registry->names[offset + tidx] = strndup(name, yyjson_get_len(key));
-        registry->locations[offset + tidx] = file;
+        // registry->locations[offset + tidx] = file;
         tidx++;
 
         IONIC_TRACE(
@@ -221,7 +223,9 @@ ko:
     return 0;
 }
 
-static size_t ionic_safetensors_discover_tensors_from_file(ionic_context_t *ctx, ionic_safetensors_t *registry, const char *const path, size_t offset, unsigned short file) {
+static size_t ionic_safetensors_discover_tensors_from_file(
+    ionic_context_t *ctx, ionic_safetensors_t *registry, const char *const path, size_t offset, const char *file)
+{
     IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "file path=%s", path);
     
     if(ionic_has_error(&ctx->error)) goto ko;
@@ -259,7 +263,8 @@ ko:
 }
 
 static size_t ionic_safetensors_discover_tensors_from_index(
-    ionic_context_t *ctx, ionic_safetensors_t *registry, yyjson_val *const root, const char *const workspace, size_t workspace_len) {
+    ionic_context_t *ctx, ionic_safetensors_t *registry, yyjson_val *const root, const char *const workspace, size_t workspace_len)
+{
     if(ionic_has_error(&ctx->error) || !root) goto ko;
     
     yyjson_val *weights = yyjson_obj_get(root, "weight_map");
@@ -279,10 +284,11 @@ static size_t ionic_safetensors_discover_tensors_from_index(
     }
 
     registry->tensors     = calloc(registry->n_tensors, sizeof(ionic_tensor_t));
-    registry->locations   = calloc(registry->n_tensors, sizeof(unsigned short));
+    // registry->locations   = calloc(registry->n_tensors, sizeof(unsigned short));
     registry->names       = calloc(registry->n_tensors, sizeof(char *));
-    registry->files = calloc(registry->n_tensors, sizeof(char *));
-    if (!registry->tensors || !registry->locations || !registry->names || !registry->files) {
+    registry->files       = calloc(registry->n_tensors, sizeof(char *));
+    // if (!registry->tensors || !registry->locations || !registry->names) {
+    if (!registry->tensors || !registry->names || !registry->files) {
         ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
         goto freeup;
     }
@@ -317,7 +323,8 @@ static size_t ionic_safetensors_discover_tensors_from_index(
 
     size_t offset = 0;
     for (size_t fi = 0; fi < registry->n_files; fi++) {
-        offset += ionic_safetensors_discover_tensors_from_file(ctx, registry, registry->files[fi], offset, fi);
+        const char *abspath = registry->files[fi];
+        offset += ionic_safetensors_discover_tensors_from_file(ctx, registry, registry->files[fi], offset, abspath);
 
         if (ionic_has_error(&ctx->error))
             break;

@@ -12,13 +12,13 @@ extern "C" {
 
 struct ionic_safetensors {
     struct ionic_tensor *tensors;
-    unsigned short      *locations;
+    // unsigned short      *locations;
     char                **names;
     char                **files;
     size_t              n_tensors;
     size_t              n_files;
     size_t              hdr_size;
-    unsigned char       _pad[8];
+    unsigned char       _pad[9];
 };
 
 typedef struct ionic_safetensors ionic_safetensors_t;

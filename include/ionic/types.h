@@ -93,9 +93,8 @@ typedef struct ionic_tensor {
     size_t end;
     ionic_data_type_t dtype;
     unsigned int shape[IONIC_MAX_RANK];
-    unsigned short file;
     unsigned char rank;
-    unsigned char padding[8];
+    const char *file;
 } ionic_tensor_t;
 
 static_assert(sizeof(ionic_tensor_t) == 64, "ionic_tensor_t must be cache line sized");
