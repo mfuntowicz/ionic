@@ -239,7 +239,7 @@ static size_t ionic_iouring_engine_fetch(
     if (ionic_has_error(&ctx->error)) return 0;
 
     struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
-    struct ionic_io_fetch_result *results = NULL;
+    struct ionic_io_fetch_result *results;
     const size_t n_chunks = ionic_iouring_engine_get_sqe_chunks(ctx, engine_, segments, count, &results);
 
     IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "fetch segments=%u, chunks=%zu", count, n_chunks);
@@ -261,7 +261,7 @@ static size_t ionic_iouring_engine_fetch(
             struct ionic_iouring_registered_file *file = ionic_iouring_engine_find_registered_file(engine_, res.fragment.file.path);
             if (!file) {
                 ionic_set_error(ctx, IONIC_ERR_WITH_MSG(IONIC_ERROR_IOENGINE_INVALID_PARAMETER, "file not registered"));
-                return 0;
+                goto cleanup;
             }
 
             struct iovec dst = iovecs[slot];
@@ -271,10 +271,10 @@ static size_t ionic_iouring_engine_fetch(
             io_uring_prep_read_fixed(sqe, file->fd, dst.iov_base, fragment.len, fragment.file.from, slot);
             sqe->user_data = (unsigned long)slot;
 
-            // engine_->slot_infos[slot] = (struct ionic_iouring_slot_info) {
-            //     .dst = fragment.data,
-            //     .len = fragment.len,
-            // };
+            engine_->slot_infos[slot] = (struct ionic_iouring_slot_info) {
+                .dst = fragment.data,
+                .len = fragment.len,
+            };
 
             io_uring_submit(ring);
             ++submitted;
@@ -284,48 +284,34 @@ static size_t ionic_iouring_engine_fetch(
         if (n_ready > 0) {
             completed += n_ready;
             for (unsigned i = 0; i < n_ready; ++i) {
-                const unsigned slot = cqes[i]->user_data;
-                // struct ionic_iouring_slot_info info = engine_->slot_infos[slot];
-                set_slot_available(&engine_->slots, slot);
-                io_uring_cqe_seen(ring, cqes[i]);
+                struct io_uring_cqe *cqe = cqes[i];
+                unsigned slot = cqe->user_data;
+
+                if (slot < engine_->config.qd) {
+                    unsigned w = slot / BITS_PER_WORD;
+                    unsigned bit = slot % BITS_PER_WORD;
+                    atomic_fetch_or_explicit(&engine_->pending[w], 1UL << bit, memory_order_release);
+                }
+
+                io_uring_cqe_seen(ring, cqe);
+
+                for (int w = 0; w < 2; ++w) {
+                    unsigned long bits = atomic_load_explicit(&engine_->done[w], memory_order_acquire);
+                    while (bits) {
+                        unsigned bit = __builtin_ctzl(bits);
+                        unsigned slot_ = w * BITS_PER_WORD + bit;
+                        set_slot_available(slots, slot_);
+                        atomic_fetch_and_explicit(&engine_->done[w], ~(1UL << bit), memory_order_release);
+                        bits = atomic_load_explicit(&engine_->done[w], memory_order_acquire);
+                        ++completed;
+                    }
+                }
             }
         }
-
-        // if (submitted == 0) {
-        //     struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000 };
-        //     io_uring_submit_and_wait(ring, 1);
-        // } else {
-        //     struct io_uring_cqe *cqe;
-        //     int ret = io_uring_wait_cqe(ring, &cqe);
-        //     if (ret < 0) {
-        //         if (ret == -EINTR) continue;
-        //         ionic_cpu_relax();
-        //         continue;
-        //     }
-        //
-        //     unsigned slot_ = (unsigned)cqe->user_data;
-        //     if (slot_ < engine_->config.qd) {
-        //         unsigned w = slot_ / BITS_PER_WORD;
-        //         unsigned bit = slot_ % BITS_PER_WORD;
-        //         atomic_fetch_or_explicit(&engine_->pending[w], 1UL << bit, memory_order_release);
-        //     }
-        //     io_uring_cqe_seen(ring, cqe);
-        // }
-
-        // for (int w = 0; w < 2; ++w) {
-        //     unsigned long bits = atomic_load_explicit(&engine_->done[w], memory_order_acquire);
-        //     while (bits) {
-        //         unsigned bit = __builtin_ctzl(bits);
-        //         unsigned slot_ = w * BITS_PER_WORD + bit;
-        //         set_slot_available(slots, slot_);
-        //         atomic_fetch_and_explicit(&engine_->done[w], ~(1UL << bit), memory_order_release);
-        //         bits = atomic_load_explicit(&engine_->done[w], memory_order_acquire);
-        //         ++completed;
-        //     }
-        // }
-
     } while (completed < n_chunks);
 
+cleanup:
+    if (cqes) free(cqes);
     if (results) free(results);
     return completed;
 }

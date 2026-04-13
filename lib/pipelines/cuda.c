@@ -1,6 +1,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <threads.h>
 #include <ionic/engine.h>
 #include <ionic/pipelines/cuda.h>
@@ -14,7 +15,13 @@
 static void ionic_pipeline_cuda_probe_ioengine(struct ionic_context *ctx, struct ionic_pipeline_cuda *pipeline) {
     IONIC_TRACE(&ctx->logger, pipeline->tag, "probing ioengine");
 #ifdef __linux__
-    struct ionic_iouring_engine_config p = { .qd = 32, .st_size = 2 * 1024 * 1024, .files = (const char **)pipeline->base.files, .n_files = pipeline->base.n_files}; // todo(mfuntowicz): move to iouring + override with envvar
+    // todo(mfuntowicz): move to iouring + override with envvar
+    struct ionic_iouring_engine_config p = {
+        .qd = 64,
+        .st_size = 2 * 1024 * 1024,
+        .files = (const char **)pipeline->base.files,
+        .n_files = pipeline->base.n_files
+    };
     pipeline->ioengine = &ionic_iouring_engine_create(ctx, &p)->base;
 #else
     ionic_set_error(ctx, IONIC_ERR_WITH_MSG(IONIC_ERROR_UNSUPPORTED, "platform not supported yet."));
@@ -145,6 +152,18 @@ size_t ionic_pipeline_cuda_fragments_from_files(
         return 0;
     }
 
+    size_t n_bytes = 0;
+    for (size_t i = 0; i < plan->n; ++i) {
+        const struct ionic_sharded_tensor st = plan->tensors[i];
+        const struct ionic_tensor *t = st.tensor;
+        n_bytes += t->end - t->start;
+    }
+
+    IONIC_DEBUG(&ctx->logger, pipeline->tag, "fragments n_bytes=%zu", n_bytes);
+    void *arena = ctx->dalloc.allocate(ctx, n_bytes, IONIC_ALLOC_DEVICE);
+    if (!arena || ionic_has_error(&ctx->error)) return 0;
+
+    size_t offset = 0;
     for (; n_segments < plan->n; ++n_segments) {
         const struct ionic_sharded_tensor st = plan->tensors[n_segments];
         const struct ionic_tensor *t = st.tensor;
@@ -153,8 +172,9 @@ size_t ionic_pipeline_cuda_fragments_from_files(
             .path = pipeline->base.files[t->file],
             .from = t->start,
             .to = t->end,
-            .dst = NULL
+            .dst = arena + offset,
         };
+        offset += t->end - t->start;
     }
 
     *out = segments;
@@ -171,24 +191,18 @@ struct dma_worker_params {
 static int ionic_pipeline_cuda_dma_worker(void *arg) {
     const struct dma_worker_params *params = (struct dma_worker_params *)arg;
 
-    char tag[32];
-    snprintf(tag, sizeof(tag), "dma_worker(%s:%u)",
-        IONIC_DEVICE_LITERAL[params->ctx->device.kind], params->ctx->device.ordinal);
-
-    IONIC_INFO(&params->ctx->logger, tag, "started");
-
+    struct ionic_context *ctx = params->ctx;
     struct ionic_pipeline_cuda *pipeline = params->pipeline;
     struct ionic_iouring_engine *engine = params->engine;
     const unsigned char concurrency = pipeline->concurrency;
 
-    int *active_slots = malloc(concurrency * sizeof(int));
-    if (!active_slots) {
-        IONIC_ERROR(&params->ctx->logger, tag, "allocation failed for active_slots");
-        goto exit;
-    }
-    for (unsigned char i = 0; i < concurrency; ++i)
-        active_slots[i] = -1;
+    char tag[32];
+    snprintf(tag, sizeof(tag), "dma_worker(%s:%u)",
+        IONIC_DEVICE_LITERAL[ctx->device.kind], ctx->device.ordinal);
 
+    IONIC_INFO(&ctx->logger, tag, "started");
+
+    int active_slots[2] = {-1, -1};
     while (atomic_load_explicit(&params->running, memory_order_acquire)) {
         for (int w = 0; w < 2; ++w) {
             unsigned long bits = atomic_load_explicit(&engine->pending[w], memory_order_acquire);
@@ -212,6 +226,8 @@ static int ionic_pipeline_cuda_dma_worker(void *arg) {
                     continue;
                 }
 
+                IONIC_DEBUG(&ctx->logger, pipeline->tag, "initiating memcpy HtoD async slot=%u", slot);
+
                 cudaMemcpyAsync(dst, src, len, cudaMemcpyHostToDevice, pipeline->streams[s]);
                 cudaEventRecord(pipeline->events[s], pipeline->streams[s]);
                 active_slots[s] = (int)slot;
@@ -229,6 +245,8 @@ static int ionic_pipeline_cuda_dma_worker(void *arg) {
                 unsigned bit = slot % BITS_PER_WORD;
                 atomic_fetch_or_explicit(&engine->done[w], 1UL << bit, memory_order_release);
                 active_slots[s] = -1;
+
+                IONIC_DEBUG(&ctx->logger, pipeline->tag, "finalized memcpy HtoD async slot=%u", slot);
             }
         }
 
@@ -243,19 +261,23 @@ static int ionic_pipeline_cuda_dma_worker(void *arg) {
             unsigned bit = slot % BITS_PER_WORD;
             atomic_fetch_or_explicit(&engine->done[w], 1UL << bit, memory_order_release);
             active_slots[s] = -1;
+
+            IONIC_DEBUG(&ctx->logger, pipeline->tag, "finalized memcpy HtoD async slot=%u", slot);
         }
     }
 
-    free(active_slots);
-
-exit:
-    IONIC_INFO(&params->ctx->logger, tag, "exited");
+    IONIC_INFO(&ctx->logger, tag, "exited");
     return 0;
 }
 
 static size_t ionic_pipeline_cuda_scheduler_loop(
     struct ionic_context *ctx, const struct ionic_pipeline_cuda *pipeline, const struct ionic_sharding_plan *plan, const unsigned short rank) {
     if (ionic_has_error(&ctx->error)) return 0;
+
+    struct ionic_io_file_segment *segments;
+    size_t n_segments = ionic_pipeline_cuda_fragments_from_files(ctx, pipeline, rank, &segments);
+    size_t n_fetched = 0;
+    if (ionic_has_error(&ctx->error)) goto cleanup;
 
     thrd_t dma_worker;
     struct dma_worker_params dma_params = {
@@ -271,19 +293,14 @@ static size_t ionic_pipeline_cuda_scheduler_loop(
         return 0;
     }
 
-    struct ionic_io_file_segment *segments;
-    size_t n_segments = ionic_pipeline_cuda_fragments_from_files(ctx, pipeline, rank, &segments);
-    size_t n_fetched = 0;
-    if (ionic_has_error(&ctx->error)) goto terminate;
-
     n_fetched = ionic_ioengine_fetch(ctx, pipeline->ioengine, segments, n_segments);
 
-terminate:
     atomic_store_explicit(&dma_params.running, 0, memory_order_release);
 
     int status = 0;
     thrd_join(dma_worker, &status);
 
+cleanup:
     if (segments) free(segments);
     return n_fetched;
 }
