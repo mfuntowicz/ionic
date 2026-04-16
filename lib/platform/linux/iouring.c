@@ -3,11 +3,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <threads.h>
 #include <sys/resource.h>
 #include <ionic/utils.h>
 
 #define IONIC_EVENT_TAG_IOENGINE_IOURING "ioengine(iouring)"
+
+static void atomic_set_bit(atomic_ulong *bits, unsigned slot) {
+    atomic_fetch_or_explicit(bits, 1UL << slot, memory_order_acq_rel);
+}
+
+static void atomic_clear_bit(atomic_ulong *bits, unsigned slot) {
+    atomic_fetch_and_explicit(bits, ~(1UL << slot), memory_order_acq_rel);
+}
 
 static struct ionic_iouring_registered_file *ionic_iouring_engine_find_registered_file(const struct ionic_iouring_engine *engine, const char *path) {
     for (size_t i = 0; i < engine->config.n_files; ++i) {
@@ -64,9 +71,10 @@ static void ionic_iouring_engine_register_files(struct ionic_context *ctx, struc
             free(fds);
             return;
         }
-
         engine->files = files;
         free(fds);
+
+        IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "registered files n=%u", config->n_files);
     }
 }
 
@@ -82,9 +90,8 @@ static void ionic_iouring_engine_register_buffers(struct ionic_context *ctx, str
         return;
     }
 
-    // one buffer per SQ entry
     void *base = ctx->dalloc.allocate(ctx, config.qd * config.st_size, IONIC_ALLOC_STAGING);
-    if (!base) goto ko; // error set by ctx->dalloc.allocate
+    if (!base) goto ko;
 
     engine->iovecs = calloc(config.qd, sizeof(struct iovec));
     if (!engine->iovecs) {
@@ -107,7 +114,6 @@ static void ionic_iouring_engine_register_buffers(struct ionic_context *ctx, str
         struct ionic_error err = IONIC_SYS_ERR_WITH_MSG(-res, "io_uring_register_buffers failed");
         ionic_set_error(ctx, err);
 
-        // RLIMIT_MEMLOCK advise
         if (err.res == ENOMEM) {
             struct rlimit rl;
             getrlimit(RLIMIT_MEMLOCK, &rl);
@@ -130,76 +136,193 @@ ko:
 }
 
 
-static size_t ionic_iouring_engine_get_sqe_chunks(
-    struct ionic_context *ctx, 
-    struct ionic_iouring_engine *engine, 
-    struct ionic_io_file_segment *segments,
-    unsigned count,
-    struct ionic_io_fetch_result **results) 
+struct ionic_chunk_key {
+    const char *path;
+    size_t offset;
+};
+
+static int ionic_chunk_key_compare(const void *a, const void *b) {
+    const struct ionic_chunk_key *ka = a, *kb = b;
+    int cmp = strcmp(ka->path, kb->path);
+    if (cmp != 0) return cmp;
+    if (ka->offset < kb->offset) return -1;
+    if (ka->offset > kb->offset) return 1;
+    return 0;
+}
+
+static ssize_t ionic_chunk_key_bsearch(const struct ionic_chunk_key *keys, size_t n, const char *path, size_t offset) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(keys[mid].path, path);
+        if (cmp < 0 || (cmp == 0 && keys[mid].offset < offset))
+            lo = mid + 1;
+        else if (cmp > 0 || (cmp == 0 && keys[mid].offset > offset))
+            hi = mid;
+        else
+            return (ssize_t)mid;
+    }
+    return -1;
+}
+
+static size_t ionic_iouring_engine_get_seq_chunks(
+    struct ionic_context *ctx,
+    struct ionic_iouring_engine *engine,
+    struct ionic_logical_segment *segments,
+    size_t count,
+    struct ionic_io_fetch_result **out)
 {
     const size_t st_size = engine->config.st_size;
 
-    size_t n_chunks = 0;
-    for (unsigned i = 0; i < count; ++i) {
-        size_t aligned_from = ionic_align_down_sz(segments[i].from, 4096);
-        size_t aligned_to = ionic_align_up_sz(segments[i].to, 4096);
-        size_t segment_size = aligned_to - aligned_from;
-        n_chunks += (segment_size + st_size - 1) / st_size;
-    }
-
-    if (n_chunks == 0) {
-        *results = NULL;
+    if (count == 0) {
+        *out = NULL;
         return 0;
     }
 
-    *results = calloc(n_chunks, sizeof(struct ionic_io_fetch_result));
-    if (!*results) {
+    size_t max_keys = 0;
+    for (size_t i = 0; i < count; ++i) {
+        size_t aligned_from = ionic_align_down_sz(segments[i].from, st_size);
+        size_t aligned_to = ionic_align_up_sz(segments[i].to, st_size);
+        max_keys += (aligned_to - aligned_from + st_size - 1) / st_size;
+    }
+
+    if (max_keys == 0) {
+        *out = NULL;
+        return 0;
+    }
+
+    struct ionic_chunk_key *keys = calloc(max_keys, sizeof(*keys));
+    if (!keys) {
         ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
-        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "failed to allocate sqe chunks");
         return 0;
     }
 
-    size_t chunk_idx = 0;
-    for (unsigned seg_idx = 0; seg_idx < count; ++seg_idx) {
-        const struct ionic_io_file_segment *seg = &segments[seg_idx];
-        size_t aligned_from = ionic_align_down_sz(seg->from, 4096);
-        size_t aligned_to = ionic_align_up_sz(seg->to, 4096);
-        
-        size_t offset = aligned_from;
-        while (offset < aligned_to) {
-            size_t chunk_end = offset + st_size;
-            if (chunk_end > aligned_to) {
-                chunk_end = aligned_to;
-            }
-
-            struct ionic_io_fetch_result *result = &(*results)[chunk_idx];
-            result->fragment.file.from = offset;
-            result->fragment.file.to = chunk_end;
-            result->fragment.file.path = seg->path;
-            result->fragment.len = chunk_end - offset;
-            result->fragment.data = seg->dst + (offset - aligned_from);
-            result->userdata = NULL;
-            
-            offset = chunk_end;
-            chunk_idx++;
+    size_t n_keys = 0;
+    for (size_t i = 0; i < count; ++i) {
+        size_t aligned_from = ionic_align_down_sz(segments[i].from, st_size);
+        size_t aligned_to = ionic_align_up_sz(segments[i].to, st_size);
+        for (size_t offset = aligned_from; offset < aligned_to; offset += st_size) {
+            keys[n_keys++] = (struct ionic_chunk_key){ segments[i].path, offset };
         }
     }
 
-    if (chunk_idx != n_chunks) {
-        IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, 
-            "chunk count mismatch: computed=%zu, actual=%zu", n_chunks, chunk_idx);
+    qsort(keys, n_keys, sizeof(*keys), ionic_chunk_key_compare);
+
+    size_t n_unique = 0;
+    for (size_t i = 0; i < n_keys; ++i) {
+        if (n_unique == 0 || ionic_chunk_key_compare(&keys[i], &keys[n_unique - 1]) != 0) {
+            keys[n_unique++] = keys[i];
+        }
     }
 
-    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, 
-        "computed sqe chunks: segments=%u, chunks=%zu", count, n_chunks);
+    *out = calloc(n_unique, sizeof(struct ionic_io_fetch_result));
+    if (!*out) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+        free(keys);
+        return 0;
+    }
 
-    return n_chunks;
+    for (size_t c = 0; c < n_unique; ++c) {
+        (*out)[c] = (struct ionic_io_fetch_result){
+            .path = keys[c].path,
+            .offset = keys[c].offset,
+            .len = st_size,
+            .entries = NULL,
+            .n_entries = 0,
+            .userdata = ULONG_MAX,
+        };
+    }
+
+    size_t *entry_counts = calloc(n_unique, sizeof(size_t));
+    if (!entry_counts) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+        for (size_t c = 0; c < n_unique; ++c) free((*out)[c].entries);
+        free(*out);
+        *out = NULL;
+        free(keys);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        const struct ionic_logical_segment *seg = &segments[i];
+        size_t aligned_from = ionic_align_down_sz(seg->from, st_size);
+        size_t aligned_to = ionic_align_up_sz(seg->to, st_size);
+
+        for (size_t offset = aligned_from; offset < aligned_to; offset += st_size) {
+            ssize_t idx = ionic_chunk_key_bsearch(keys, n_unique, seg->path, offset);
+            if (idx < 0) continue;
+
+            size_t overlap_start = seg->from > offset ? seg->from : offset;
+            size_t overlap_end = seg->to < (offset + st_size) ? seg->to : (offset + st_size);
+            if (overlap_start >= overlap_end) continue;
+
+            entry_counts[idx]++;
+        }
+    }
+
+    for (size_t c = 0; c < n_unique; ++c) {
+        if (entry_counts[c] > 0) {
+            (*out)[c].entries = calloc(entry_counts[c], sizeof(struct ionic_scatter_entry));
+            (*out)[c].n_entries = entry_counts[c];
+            if (!(*out)[c].entries) {
+                ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+                for (size_t j = 0; j < c; ++j) free((*out)[j].entries);
+                free(*out);
+                *out = NULL;
+                free(entry_counts);
+                free(keys);
+                return 0;
+            }
+        }
+    }
+
+    size_t *fill_idx = calloc(n_unique, sizeof(size_t));
+    if (!fill_idx) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+        for (size_t c = 0; c < n_unique; ++c) free((*out)[c].entries);
+        free(*out);
+        *out = NULL;
+        free(entry_counts);
+        free(keys);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        const struct ionic_logical_segment *seg = &segments[i];
+        size_t aligned_from = ionic_align_down_sz(seg->from, st_size);
+        size_t aligned_to = ionic_align_up_sz(seg->to, st_size);
+
+        for (size_t offset = aligned_from; offset < aligned_to; offset += st_size) {
+            ssize_t idx = ionic_chunk_key_bsearch(keys, n_unique, seg->path, offset);
+            if (idx < 0) continue;
+
+            size_t overlap_start = seg->from > offset ? seg->from : offset;
+            size_t overlap_end = seg->to < (offset + st_size) ? seg->to : (offset + st_size);
+            if (overlap_start >= overlap_end) continue;
+
+            struct ionic_io_fetch_result *result = &(*out)[idx];
+            size_t ei = fill_idx[idx]++;
+            result->entries[ei] = (struct ionic_scatter_entry){
+                .staging_offset = overlap_start - offset,
+                .len = overlap_end - overlap_start,
+                .dst = seg->dst ? (char *)seg->dst + (overlap_start - seg->from) : NULL,
+            };
+        }
+    }
+
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING,
+        "computed seq chunks: segments=%zu, chunks=%zu", count, n_unique);
+
+    free(fill_idx);
+    free(entry_counts);
+    free(keys);
+    return n_unique;
 }
 
 
 static void ionic_iouring_engine_destroy(struct ionic_ioengine *engine) {
     struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
-    if (engine_->slot_infos) free(engine_->slot_infos);
+    if (engine_->results) free(engine_->results);
 }
 
 static void ionic_iouring_engine_init(struct ionic_context *ctx, struct ionic_ioengine *engine) {
@@ -207,21 +330,30 @@ static void ionic_iouring_engine_init(struct ionic_context *ctx, struct ionic_io
 
     struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
 
-    unsigned qd = engine_->config.qd;
-    if (qd >= BITS_PER_WORD) {
-        engine_->slots[0] = SLOT_ALL_AVAILABLE;
-        engine_->slots[1] = qd >= 2 * BITS_PER_WORD ? SLOT_ALL_AVAILABLE : 0;
-    } else {
-        engine_->slots[0] = (qd == BITS_PER_WORD) ? SLOT_ALL_AVAILABLE : ((1UL << qd) - 1);
-        engine_->slots[1] = 0;
+    if (engine_->config.qd == 0) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_INVALID_VALUE));
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "invalid queue depth == 0 (got %u)", engine_->config.qd);
+        return;
     }
-    atomic_store_explicit(&engine_->pending[0], 0, memory_order_relaxed);
-    atomic_store_explicit(&engine_->pending[1], 0, memory_order_relaxed);
-    atomic_store_explicit(&engine_->done[0], 0, memory_order_relaxed);
-    atomic_store_explicit(&engine_->done[1], 0, memory_order_relaxed);
 
-    engine_->slot_infos = calloc(engine_->config.qd, sizeof(struct ionic_iouring_slot_info));
-    if (!engine_->slot_infos) {
+    if (engine_->config.qd > 64) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_INVALID_VALUE));
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "invalid queue depth should < 64 (got %u)", engine_->config.qd);
+        return;
+    }
+
+    if (__builtin_popcount(engine_->config.qd) > 1) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_INVALID_VALUE));
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "invalid queue depth should be a power of 2 (got %u)", engine_->config.qd);
+        return;
+    }
+
+    engine_->slots = ULONG_MAX; // TODO(mfuntowicz): use a mask to the number of actual slots from config->qd
+    atomic_store_explicit(&engine_->pending, 0, memory_order_relaxed);
+    atomic_store_explicit(&engine_->done, 0, memory_order_relaxed);
+
+    engine_->results = calloc(engine_->config.qd, sizeof(struct ionic_io_fetch_result *));
+    if (!engine_->results) {
         ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
         return;
     }
@@ -234,94 +366,117 @@ static void ionic_iouring_engine_init(struct ionic_context *ctx, struct ionic_io
 }
 
 static size_t ionic_iouring_engine_fetch(
-    struct ionic_context *ctx, struct ionic_ioengine *engine, struct ionic_io_file_segment *segments, const unsigned count) {
+    struct ionic_context *ctx, struct ionic_ioengine *engine, struct ionic_logical_segment *segments, const size_t count) {
 
     if (ionic_has_error(&ctx->error)) return 0;
 
     struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
     struct ionic_io_fetch_result *results;
-    const size_t n_chunks = ionic_iouring_engine_get_sqe_chunks(ctx, engine_, segments, count, &results);
+    const size_t n_chunks = ionic_iouring_engine_get_seq_chunks(ctx, engine_, segments, count, &results);
 
-    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "fetch segments=%u, chunks=%zu", count, n_chunks);
+    if (ionic_has_error(&ctx->error)) return 0;
 
-    unsigned long (*slots)[2] = &engine_->slots;
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "fetch segments=%zu, chunks=%zu", count, n_chunks);
+
+    unsigned long *slots = &engine_->slots;
     struct iovec *iovecs = engine_->iovecs;
     struct io_uring_cqe **cqes = calloc(engine_->config.qd, sizeof(struct io_uring_cqe *));
     struct io_uring *ring = &engine_->ring;
 
     size_t submitted = 0, completed = 0;
     do {
+        unsigned char has_new_entries = 0;
         while (submitted < n_chunks) {
-            const int slot = get_available_slot(slots);
+            const int slot = get_slot_available(slots);
             if (slot < 0) break;
 
-            set_slot_busy(slots, slot);
+            struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+            if (!sqe) break;
 
-            struct ionic_io_fetch_result res = results[submitted];
-            struct ionic_iouring_registered_file *file = ionic_iouring_engine_find_registered_file(engine_, res.fragment.file.path);
+            mark_slot_busy(slots, slot);
+
+            struct iovec dst = iovecs[slot];
+            struct ionic_io_fetch_result *res = results + submitted;
+            struct ionic_iouring_registered_file *file = ionic_iouring_engine_find_registered_file(engine_, res->path);
             if (!file) {
                 ionic_set_error(ctx, IONIC_ERR_WITH_MSG(IONIC_ERROR_IOENGINE_INVALID_PARAMETER, "file not registered"));
                 goto cleanup;
             }
 
-            struct iovec dst = iovecs[slot];
-            struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-            struct ionic_io_fragment fragment = res.fragment;
-
-            io_uring_prep_read_fixed(sqe, file->fd, dst.iov_base, fragment.len, fragment.file.from, slot);
             sqe->user_data = (unsigned long)slot;
+            res->userdata = (unsigned long)slot;
+            res->data = dst.iov_base;
+            engine_->results[slot] = res;
 
-            engine_->slot_infos[slot] = (struct ionic_iouring_slot_info) {
-                .dst = fragment.data,
-                .len = fragment.len,
-            };
-
-            io_uring_submit(ring);
+            io_uring_prep_read_fixed(sqe, file->fd, dst.iov_base, res->len, res->offset, slot);
             ++submitted;
+            has_new_entries = 1;
         }
+
+        if (has_new_entries)
+            io_uring_submit(ring);
 
         const unsigned n_ready = io_uring_peek_batch_cqe(ring, cqes, engine_->config.qd);
         if (n_ready > 0) {
             completed += n_ready;
             for (unsigned i = 0; i < n_ready; ++i) {
                 struct io_uring_cqe *cqe = cqes[i];
-                unsigned slot = cqe->user_data;
+                const unsigned long slot = cqe->user_data;
 
-                if (slot < engine_->config.qd) {
-                    unsigned w = slot / BITS_PER_WORD;
-                    unsigned bit = slot % BITS_PER_WORD;
-                    atomic_fetch_or_explicit(&engine_->pending[w], 1UL << bit, memory_order_release);
-                }
+                if (slot < engine_->config.qd)
+                    atomic_set_bit(&engine_->pending, slot); // inform dma worker some are pending
 
-                io_uring_cqe_seen(ring, cqe);
+                io_uring_cqe_seen(ring, cqe);  // release iouring cqe marking for reuse
+            }
+        }
 
-                for (int w = 0; w < 2; ++w) {
-                    unsigned long bits = atomic_load_explicit(&engine_->done[w], memory_order_acquire);
-                    while (bits) {
-                        unsigned bit = __builtin_ctzl(bits);
-                        unsigned slot_ = w * BITS_PER_WORD + bit;
-                        set_slot_available(slots, slot_);
-                        atomic_fetch_and_explicit(&engine_->done[w], ~(1UL << bit), memory_order_release);
-                        bits = atomic_load_explicit(&engine_->done[w], memory_order_acquire);
-                        ++completed;
-                    }
-                }
+        unsigned long ready;
+        while ((ready = atomic_load_explicit(&engine_->done, memory_order_acquire))) {
+            if (has_slot_available(ready)) {
+                unsigned long slot = get_slot_available(&ready);
+                atomic_clear_bit(&engine_->done, slot);
+                set_slot_available(slots, slot);
             }
         }
     } while (completed < n_chunks);
 
 cleanup:
     if (cqes) free(cqes);
-    if (results) free(results);
+    if (results) {
+        for (size_t i = 0; i < n_chunks; ++i)
+            if (results[i].entries) free(results[i].entries);
+
+        free(results);
+    }
+
     return completed;
 }
 
-static void ionic_iouring_engine_mark_done(struct ionic_ioengine *engine, struct ionic_io_fetch_result *res) {
+static size_t ionic_iouring_engine_peek(struct ionic_context *ctx, struct ionic_ioengine *engine, struct ionic_io_fetch_result **res, size_t count) {
     struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
-    unsigned slot = (unsigned)(uintptr_t)res->userdata;
-    unsigned w = slot / BITS_PER_WORD;
-    unsigned bit = slot % BITS_PER_WORD;
-    atomic_fetch_or_explicit(&engine_->done[w], 1UL << bit, memory_order_release);
+    unsigned long pending = atomic_load_explicit(&engine_->pending, memory_order_acquire);;
+
+    if (pending == 0) return 0;
+
+    size_t filled = 0;
+    while (pending && filled < count) {
+        int slot = get_slot_available(&pending);
+        res[filled] = engine_->results[slot];
+
+        atomic_clear_bit(&engine_->pending, slot);
+        pending = atomic_load_explicit(&engine_->pending, memory_order_acquire);
+        ++filled;
+    }
+
+    return filled;
+}
+
+static void ionic_iouring_engine_mark_done(struct ionic_context *ctx, struct ionic_ioengine *engine, const struct ionic_io_fetch_result *res) {
+    struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
+    const unsigned long slot = (unsigned long)res->userdata;
+    atomic_set_bit(&engine_->done, slot);
+
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "slot done slot=%u", slot);
 }
 
 static void ionic_iouring_engine_probe_ring(struct ionic_context *ctx, struct io_uring_params *params, unsigned qd) {
@@ -337,9 +492,8 @@ static void ionic_iouring_engine_probe_ring(struct ionic_context *ctx, struct io
     }
 
     struct io_uring_probe *probe = io_uring_get_probe_ring(&ring);
-    if (!probe) {
+    if (!probe)
         return;
-    }
 
     if (!io_uring_opcode_supported(probe, IORING_OP_READ)) {
         struct ionic_error err = IONIC_ERR_WITH_MSG(IONIC_ERROR_UNSUPPORTED, "probe failed feature=IORING_OP_READ not supported");
@@ -368,11 +522,12 @@ struct ionic_iouring_engine *ionic_iouring_engine_create(struct ionic_context *c
     if (ionic_has_error(&ctx->error)) goto ko;
 
     struct ionic_iouring_engine *engine = malloc(sizeof(struct ionic_iouring_engine));
-    engine->config          = *config;
-    engine->base.initialize = ionic_iouring_engine_init;
-    engine->base.destroy    = ionic_iouring_engine_destroy;
-    engine->base.fetch      = ionic_iouring_engine_fetch;
-    engine->base.mark_done  = ionic_iouring_engine_mark_done;
+    engine->config             = *config;
+    engine->base.initialize    = ionic_iouring_engine_init;
+    engine->base.destroy       = ionic_iouring_engine_destroy;
+    engine->base.fetch         = ionic_iouring_engine_fetch;
+    engine->base.peek          = ionic_iouring_engine_peek;
+    engine->base.mark_done     = ionic_iouring_engine_mark_done;
 
     return engine;
 ko:

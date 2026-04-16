@@ -16,6 +16,9 @@ struct ionic_pipeline_cuda {
     cudaStream_t *streams;
     cudaEvent_t  *events;
 
+    void  *device_buffer;
+    size_t device_buffer_size;
+
     size_t threshold;
     unsigned char concurrency;
     char tag[24];
