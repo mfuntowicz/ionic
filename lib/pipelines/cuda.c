@@ -163,27 +163,27 @@ static int ionic_pipeline_cuda_dma_worker(void *arg) {
     IONIC_INFO(&ctx->logger, tag, "started");
 
     // there is always a maximum of 2 async copy engine(s) on Nvidia hardware
-    ssize_t dmas[2] = { -1, -1 };
+    struct ionic_io_fetch_result *dmas[2] = {  NULL, NULL };
     struct ionic_io_fetch_result *res[8];
     while (atomic_load_explicit(&params->running, memory_order_acquire)) {
 
-        const size_t count = engine->peek(ctx, engine, res, 8);
+        size_t count = engine->peek(ctx, engine, res, 8);
         if (count > 0) {
             IONIC_INFO(&ctx->logger, tag, "ioengine peek count=%zu", count);
 
             while (count > 0){
                 const struct ionic_io_fetch_result *r = res[count - 1];
-                if (dmas[0] == -1 || dmas[1] == -1) {
-                    const int dma = dmas[0] == -1 ? 0 : 1;
+                if (!dmas[0] || !dmas[1]) {
+                    const int dma = !dmas[0] ? 0 : 1;
 
                     for (size_t n = 0; n < r->n_entries; ++n) {
                         const struct ionic_scatter_entry *entry = &r->entries[n];
                         if (entry->dst) {
                             const cudaError_t err = cudaMemcpyAsync(
                                 entry->dst,
-                                r->data + r->offset,
+                                r->data + entry->staging_offset,
                                 entry->len,
-                                cudaMemcpyDeviceToHost,
+                                cudaMemcpyHostToDevice,
                                 pipeline->streams[dma]
                             );
 
@@ -194,22 +194,25 @@ static int ionic_pipeline_cuda_dma_worker(void *arg) {
                             }
 
                             cudaEventRecord(pipeline->events[dma], pipeline->streams[dma]);
-                            dmas[dma] = (ssize_t)r->userdata;  // no problem we have ~64 slots max in a long word
+                            dmas[dma] = r;
                         }
                     }
+
+                    --count;
                 }
 
                 for (unsigned i = 0; i < 2; ++i) {
-                    if (dmas[i] >= 0) {
+                    if (dmas[i]) {
                         if (cudaEventQuery(pipeline->events[i]) == cudaSuccess) {
-                            const unsigned slot = (unsigned)dmas[i];
-                            engine->mark_done(ctx, engine, res[slot]);
-                            dmas[i] = -1;
+                            engine->mark_done(ctx, engine, dmas[i]);
+                            dmas[i] = NULL;
 
-                            IONIC_DEBUG(&ctx->logger, tag, "memcpy HtoD async done slot=%u", slot);
+                            IONIC_DEBUG(&ctx->logger, tag, "memcpy HtoD async done");
                         }
                     }
                 }
+
+                ionic_cpu_relax();
             }
         }
 
@@ -217,13 +220,12 @@ static int ionic_pipeline_cuda_dma_worker(void *arg) {
     }
 
     for (unsigned i = 0; i < 2; ++i) {
-        if (dmas[i] >= 0) {
+        if (dmas[i]) {
             cudaEventSynchronize(pipeline->events[i]);
-            const unsigned slot = (unsigned)dmas[i];
-            engine->mark_done(ctx, engine, res[slot]);
-            dmas[i] = -1;
+            engine->mark_done(ctx, engine, dmas[i]);
+            dmas[i] = NULL;
 
-            IONIC_DEBUG(&ctx->logger, pipeline->tag, "finalized memcpy HtoD async slot=%u", slot);
+            IONIC_DEBUG(&ctx->logger, pipeline->tag, "finalized memcpy HtoD async");
         }
     }
 

@@ -322,7 +322,11 @@ static size_t ionic_iouring_engine_get_seq_chunks(
 
 static void ionic_iouring_engine_destroy(struct ionic_ioengine *engine) {
     struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
-    if (engine_->results) free(engine_->results);
+    if (engine_->results) {
+        for (size_t i = 0; i < engine_->config.qd; ++i)
+            if (engine_->results[i].entries) free(engine_->results[i].entries);
+        free(engine_->results);
+    }
 }
 
 static void ionic_iouring_engine_init(struct ionic_context *ctx, struct ionic_ioengine *engine) {
@@ -352,7 +356,7 @@ static void ionic_iouring_engine_init(struct ionic_context *ctx, struct ionic_io
     atomic_store_explicit(&engine_->pending, 0, memory_order_relaxed);
     atomic_store_explicit(&engine_->done, 0, memory_order_relaxed);
 
-    engine_->results = calloc(engine_->config.qd, sizeof(struct ionic_io_fetch_result *));
+    engine_->results = calloc(engine_->config.qd, sizeof(struct ionic_io_fetch_result));
     if (!engine_->results) {
         ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
         return;
@@ -406,7 +410,10 @@ static size_t ionic_iouring_engine_fetch(
             sqe->user_data = (unsigned long)slot;
             res->userdata = (unsigned long)slot;
             res->data = dst.iov_base;
-            engine_->results[slot] = res;
+            if (engine_->results[slot].entries) {
+                free(engine_->results[slot].entries);
+            }
+            engine_->results[slot] = *res;
 
             io_uring_prep_read_fixed(sqe, file->fd, dst.iov_base, res->len, res->offset, slot);
             ++submitted;
@@ -443,9 +450,8 @@ static size_t ionic_iouring_engine_fetch(
 cleanup:
     if (cqes) free(cqes);
     if (results) {
-        for (size_t i = 0; i < n_chunks; ++i)
+        for (size_t i = submitted; i < n_chunks; ++i)
             if (results[i].entries) free(results[i].entries);
-
         free(results);
     }
 
@@ -461,7 +467,7 @@ static size_t ionic_iouring_engine_peek(struct ionic_context *ctx, struct ionic_
     size_t filled = 0;
     while (pending && filled < count) {
         int slot = get_slot_available(&pending);
-        res[filled] = engine_->results[slot];
+        res[filled] = &engine_->results[slot];
 
         atomic_clear_bit(&engine_->pending, slot);
         pending = atomic_load_explicit(&engine_->pending, memory_order_acquire);

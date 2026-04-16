@@ -36,7 +36,7 @@ struct ionic_iouring_engine {
     unsigned long slots;
     _Atomic unsigned long pending;
     _Atomic unsigned long done;
-    struct ionic_io_fetch_result **results;
+    struct ionic_io_fetch_result *results;
     struct ionic_iouring_registered_file *files;
 };
 
