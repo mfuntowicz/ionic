@@ -57,6 +57,16 @@ int main(int argc, char **argv)
     ionic_pipeline_init(&ctx, pipeline, registry.files, registry.n_tensors, registry.n_files);
     size_t n = ionic_pipeline_execute(&ctx, pipeline, &plan, 0);
 
+    for (size_t i = 0; i < plan.n; i++) {
+        for (unsigned char w = 0; w < world_size; w++) {
+            if (!ionic_sharded_tensor_is_loaded(&plan.tensors[i].specs[0])) {
+                printf("Not loaded (tensor: %zu, rank: %u)", i, w);
+                return -1;
+            }
+        }
+    }
+
+    ionic_sharding_plan_destroy(&ctx, &plan);
     ionic_planner_destroy(planner);
     ionic_safetensors_destroy(&registry);
     ionic_context_destroy(&ctx);

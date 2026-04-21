@@ -32,7 +32,12 @@ struct ionic_sharded_tensor_specs {
     size_t              start;
     size_t              end;
     void                *dst;  // nullable
+    atomic_size_t       loaded;
 };
+
+IONIC_INLINE ionic_bool_t ionic_sharded_tensor_is_loaded(const struct ionic_sharded_tensor_specs *specs) NO_EXCEPT {
+    return atomic_load_explicit(&specs->loaded, memory_order_acquire) == (specs->end - specs->start);
+}
 
 struct ionic_sharded_tensor {
     struct ionic_sharded_tensor_specs *specs;  // [world_size], specs for each rank

@@ -17,7 +17,7 @@ static void ionic_pipeline_cuda_probe_ioengine(struct ionic_context *ctx, struct
 #ifdef __linux__
     struct ionic_iouring_engine_config p = {
         .qd = 64,
-        .st_size = 2 * 1024 * 1024,
+        .st_size = 128 * 1024,
         .files = (const char **)pipeline->base.files,
         .n_files = pipeline->base.n_files
     };
@@ -204,6 +204,13 @@ static int ionic_pipeline_cuda_dma_worker(void *arg) {
                 for (unsigned i = 0; i < 2; ++i) {
                     if (dmas[i]) {
                         if (cudaEventQuery(pipeline->events[i]) == cudaSuccess) {
+                            for (size_t n = 0; n < dmas[i]->n_entries; ++n) {
+                                const struct ionic_scatter_entry *entry = &dmas[i]->entries[n];
+                                if (entry->dst && entry->userdata) {
+                                    struct ionic_sharded_tensor_specs *specs = entry->userdata;
+                                    atomic_fetch_add_explicit(&specs->loaded, entry->len, memory_order_release);
+                                }
+                            }
                             engine->mark_done(ctx, engine, dmas[i]);
                             dmas[i] = NULL;
 
@@ -222,6 +229,13 @@ static int ionic_pipeline_cuda_dma_worker(void *arg) {
     for (unsigned i = 0; i < 2; ++i) {
         if (dmas[i]) {
             cudaEventSynchronize(pipeline->events[i]);
+            for (size_t n = 0; n < dmas[i]->n_entries; ++n) {
+                const struct ionic_scatter_entry *entry = &dmas[i]->entries[n];
+                if (entry->dst && entry->userdata) {
+                    struct ionic_sharded_tensor_specs *specs = entry->userdata;
+                    atomic_fetch_add_explicit(&specs->loaded, entry->len, memory_order_release);
+                }
+            }
             engine->mark_done(ctx, engine, dmas[i]);
             dmas[i] = NULL;
 
@@ -271,11 +285,14 @@ static size_t ionic_pipeline_cuda_scheduler_loop(
     size_t running_offset = 0;
     for (size_t i = 0; i < plan->n; ++i) {
         const struct ionic_tensor *t = plan->tensors[i].tensor;
+        struct ionic_sharded_tensor_specs *specs = plan->tensors[i].specs + rank;
+        atomic_store_explicit(&specs->loaded, 0, memory_order_relaxed);
         segments[i] = (struct ionic_logical_segment){
             .path = t->file,
             .from = t->start,
             .to = t->end,
             .dst = (char *)device_buffer + running_offset,
+            .userdata = specs,
         };
         running_offset += t->end - t->start;
     }

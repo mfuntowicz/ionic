@@ -60,6 +60,21 @@ void ionic_planner_destroy(ionic_planner_t *planner) {
     }
 }
 
+void ionic_sharding_plan_destroy(ionic_context_t *ctx, ionic_sharding_plan_t *plan) {
+    IONIC_UNUSED(ctx);
+    if (plan) {
+        if (plan->tensors) {
+            for (size_t i = 0; i < plan->n; ++i) {
+                if (plan->tensors[i].specs) free(plan->tensors[i].specs);
+            }
+            free(plan->tensors);
+        }
+        plan->tensors = NULL;
+        plan->n = 0;
+        plan->world_size = 0;
+    }
+}
+
 void ionic_planner_shard(ionic_context_t *ctx, ionic_planner_t *planner, const struct ionic_tensor *tensor, enum ionic_sharding_kind kind) {
     if (ionic_has_error(&ctx->error) || !planner || !tensor)
         return;

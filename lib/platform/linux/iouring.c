@@ -306,6 +306,7 @@ static size_t ionic_iouring_engine_get_seq_chunks(
                 .staging_offset = overlap_start - offset,
                 .len = overlap_end - overlap_start,
                 .dst = seg->dst ? (char *)seg->dst + (overlap_start - seg->from) : NULL,
+                .userdata = seg->userdata,
             };
         }
     }

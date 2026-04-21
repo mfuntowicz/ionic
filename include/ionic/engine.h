@@ -7,6 +7,7 @@ struct ionic_scatter_entry {
     size_t staging_offset;
     size_t len;
     void  *dst;
+    void  *userdata;
 };
 
 struct ionic_logical_segment {
@@ -14,6 +15,7 @@ struct ionic_logical_segment {
     size_t from;
     size_t to;
     void  *dst;
+    void  *userdata;
 };
 
 struct ionic_io_fetch_result {
