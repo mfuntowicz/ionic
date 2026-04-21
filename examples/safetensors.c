@@ -56,11 +56,15 @@ int main(int argc, char **argv)
 
     ionic_pipeline_init(&ctx, pipeline, registry.files, registry.n_tensors, registry.n_files);
     size_t n = ionic_pipeline_execute(&ctx, pipeline, &plan, 0);
+    if (n != registry.n_tensors) {
+        fprintf(stderr, "Failed to load all tensors\n");
+        return -1;
+    }
 
     for (size_t i = 0; i < plan.n; i++) {
         for (unsigned char w = 0; w < world_size; w++) {
             if (!ionic_sharded_tensor_is_loaded(&plan.tensors[i].specs[0])) {
-                printf("Not loaded (tensor: %zu, rank: %u)", i, w);
+                printf("Validation failed: tensor not fully loaded (tensor: %zu, rank: %u)", i, w);
                 return -1;
             }
         }
