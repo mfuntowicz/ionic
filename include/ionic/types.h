@@ -3,9 +3,62 @@
 
 #include <assert.h>
 #include <stddef.h>
+#include <stdatomic.h>
 
+#define IONIC_FALSE 0u
+typedef unsigned char ionic_bool;
+typedef ionic_bool ionic_bool_t;
 
-enum ionic_data_type {
+struct ionic_context;
+
+#if defined(_WIN32)
+#include <windows.h>
+typedef HANDLE ionic_fd;
+#else
+typedef int ionic_fd;
+#endif
+
+typedef ionic_fd ionic_fd_t;
+
+struct ionic_file {
+    ionic_fd fd;
+    void *content;
+};
+
+typedef struct ionic_file ionic_file_t;
+
+typedef enum ionic_device_kind {
+    IONIC_DEVICE_CPU,
+    IONIC_DEVICE_CUDA
+} ionic_device_kind_t;
+
+static const char *IONIC_DEVICE_LITERAL[] = {
+    [IONIC_DEVICE_CPU] = "cpu",
+    [IONIC_DEVICE_CUDA] = "cuda"
+};
+
+typedef struct ionic_device {
+    enum ionic_device_kind kind;
+    unsigned char ordinal;
+} ionic_device_t;
+
+enum ionic_allocation_kind {
+    IONIC_ALLOC_DEVICE,
+    IONIC_ALLOC_STAGING,
+};
+
+typedef struct ionic_allocator {
+    void *(*allocate)(struct ionic_context *ctx, size_t size, enum ionic_allocation_kind kind);
+    void (*free)(struct ionic_context *ctx, void *ptr, enum ionic_allocation_kind kind);
+} ionic_allocator_t;
+
+typedef struct ionic_barrier {
+    atomic_uint   steps;
+    atomic_uchar  ready; // max 16 devices per hosts
+    unsigned char total; // max 16 devices per hosts
+} ionic_barrier_t;
+
+typedef enum ionic_data_type {
     IONIC_DATA_TYPE_BOOL,
     IONIC_DATA_TYPE_BFLOAT16,
     IONIC_DATA_TYPE_COMPLEX,
@@ -29,23 +82,21 @@ enum ionic_data_type {
     IONIC_DATA_TYPE_UNSIGNED_INT32,
     IONIC_DATA_TYPE_UNSIGNED_INT64,
     IONIC_DATA_TYPE_UNKNOWN
-};
-typedef enum ionic_data_type ionic_data_type_t;
+} ionic_data_type_t;
 
 #ifndef IONIC_MAX_RANK
 #define IONIC_MAX_RANK 8
 #endif
 
-struct ionic_tensor {
+typedef struct ionic_tensor {
     size_t start;
     size_t end;
     ionic_data_type_t dtype;
     unsigned int shape[IONIC_MAX_RANK];
-    unsigned short file;
     unsigned char rank;
-    unsigned char padding[8];
-};
-typedef struct ionic_tensor ionic_tensor_t;
+    const char *file;
+} ionic_tensor_t;
+
 static_assert(sizeof(ionic_tensor_t) == 64, "ionic_tensor_t must be cache line sized");
 
 #endif // IONIC_TYPES_H

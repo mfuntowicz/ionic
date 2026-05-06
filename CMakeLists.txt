@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.26)
 project(ionic VERSION 0.1.0 LANGUAGES C)
 
+set(CMAKE_C_STANDARD 17)
+
 include(FetchContent)
 include(cmake/numa.cmake)
 
@@ -12,12 +14,32 @@ option(IONIC_ENABLE_CUDA "Enable CUDA support" OFF)
 option(IONIC_ENABLE_SAFETENSORS "Enable Safetensors support" OFF)
 
 set(IONIC_LIBS "NUMA::numa")
-set(IONIC_SOURCES lib/context.c lib/memory.c lib/logging.c)
-set(IONIC_HEADERS include/ionic/ionic.h include/ionic/types.h include/ionic/logging.h include/ionic/topology.h)
+set(IONIC_SOURCES
+    lib/context.c
+    lib/memory.c
+    lib/logging.c
+    lib/planner.c
+    lib/pipeline.c
+)
+set(IONIC_HEADERS 
+    include/ionic/ionic.h 
+    include/ionic/types.h
+    include/ionic/engine.h
+    include/ionic/error.h
+    include/ionic/file.h
+    include/ionic/logging.h
+    include/ionic/topology.h
+    include/ionic/planner.h
+    include/ionic/pipeline.h
+)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     include(cmake/liburing.cmake)
+    list(APPEND IONIC_HEADERS include/ionic/platform/linux/file.h)
+    list(APPEND IONIC_HEADERS include/ionic/platform/linux/iouring.h)
+
     list(APPEND IONIC_SOURCES lib/platform/linux/topology.c)
+    list(APPEND IONIC_SOURCES lib/platform/linux/memory.c)
     list(APPEND IONIC_SOURCES lib/platform/linux/iouring.c)
     list(APPEND IONIC_LIBS liburing_static)
     add_compile_definitions(_GNU_SOURCE)
@@ -27,6 +49,11 @@ if(IONIC_ENABLE_CUDA)
     message(STATUS "CUDA support enabled")
     find_package(CUDAToolkit REQUIRED COMPONENTS CUDA::cudart)
     list(APPEND IONIC_LIBS CUDA::cudart)
+
+    list(APPEND IONIC_HEADERS include/ionic/pipelines/cuda.h)
+    list(APPEND IONIC_SOURCES lib/pipelines/cuda.c)
+
+    add_compile_definitions(__IONIC_CUDA_ENABLED__=1)
 endif()
 
 if(IONIC_ENABLE_SAFETENSORS)
@@ -41,7 +68,7 @@ if(IONIC_ENABLE_SAFETENSORS)
 endif()
 
 add_library(ionic STATIC ${IONIC_SOURCES} ${IONIC_HEADERS})
-target_link_libraries(ionic PRIVATE ${IONIC_LIBS})
+target_link_libraries(ionic PUBLIC ${IONIC_LIBS})
 target_include_directories(ionic PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>

@@ -37,7 +37,7 @@ void ionic_log(ionic_logger_t *logger, ionic_log_level_t level, const char *tag,
     if (!logger->ready) ionic_logger_init(logger);
     if (level > logger->level) return;
 
-    fprintf(stderr, "[%-6s] [%-12s] ", LEVEL_NAMES[level], tag);
+    fprintf(stderr, "[%-6s] [%-18s] ", LEVEL_NAMES[level], tag);
 
     va_list args;
     va_start(args, fmt);

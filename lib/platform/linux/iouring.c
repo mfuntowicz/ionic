@@ -1,524 +1,542 @@
-#include <errno.h>
-#include <fcntl.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/mman.h>
-#include <unistd.h>
-#include <liburing.h>
-#include <ionic/ionic.h>
 #include <ionic/platform/linux/iouring.h>
 
-#define IONIC_IOURING_TAG "io-uring"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <ionic/utils.h>
 
-#define IONIC_IOURING_QD_ENV_VAR   "IONIC_IOURING_QUEUE_DEPTH"
-#define IONIC_IOURING_QD_DEFAULT   128U
+#define IONIC_EVENT_TAG_IOENGINE_IOURING "ioengine(iouring)"
 
-#define IONIC_IOURING_BLOCK_SHIFT  12
-#define IONIC_IOURING_BLOCK_SIZE   (1U << IONIC_IOURING_BLOCK_SHIFT) /* 4096 */
-#define IONIC_IOURING_BLOCK_MASK   (IONIC_IOURING_BLOCK_SIZE - 1U)
-
-#define IONIC_IOURING_SLOT_BLOCKS  32U
-#define IONIC_IOURING_SLOT_SIZE    (IONIC_IOURING_SLOT_BLOCKS * IONIC_IOURING_BLOCK_SIZE) /* 128 KiB per slot */
-
-/* ── slot bitmap helpers ──────────────────────────────────────────── */
-
-typedef unsigned long slotword_t;
-#define SLOT_BITS (sizeof(slotword_t) * 8)
-
-struct ionic_arena {
-    unsigned char  *buf;        /* mmap'd, page-aligned staging area      */
-    size_t          buf_len;    /* total byte length of buf               */
-    slotword_t     *free_map;   /* 1 = free, 0 = in-flight               */
-    size_t          nslots;     /* total slot count                       */
-    size_t          nwords;     /* number of words in free_map            */
-};
-
-static inline void arena_slot_set_free(struct ionic_arena *a, size_t idx)
-{
-    a->free_map[idx / SLOT_BITS] |= (slotword_t)1 << (idx % SLOT_BITS);
+static void atomic_set_bit(atomic_ulong *bits, unsigned slot) {
+    atomic_fetch_or_explicit(bits, 1UL << slot, memory_order_acq_rel);
 }
 
-static inline void arena_slot_set_busy(struct ionic_arena *a, size_t idx)
-{
-    a->free_map[idx / SLOT_BITS] &= ~((slotword_t)1 << (idx % SLOT_BITS));
+static void atomic_clear_bit(atomic_ulong *bits, unsigned slot) {
+    atomic_fetch_and_explicit(bits, ~(1UL << slot), memory_order_acq_rel);
 }
 
-/*
- * Find and claim the first free slot.  Returns the slot index or (size_t)-1
- * when the arena is full.
- */
-static size_t arena_slot_acquire(struct ionic_arena *a)
-{
-    for (size_t w = 0; w < a->nwords; ++w) {
-        if (a->free_map[w] == 0)
-            continue;
-        int bit = __builtin_ctzl(a->free_map[w]);
-        size_t idx = w * SLOT_BITS + (size_t)bit;
-        if (idx >= a->nslots)
-            return (size_t)-1;
-        arena_slot_set_busy(a, idx);
-        return idx;
-    }
-    return (size_t)-1;
-}
-
-static inline unsigned char *arena_slot_ptr(struct ionic_arena *a, size_t idx)
-{
-    return a->buf + idx * IONIC_IOURING_SLOT_SIZE;
-}
-
-/* ── completion cookie packed into sqe->user_data ─────────────────
- *
- *   63        52 51     40 39                     0
- *  ┌────────────┬─────────┬────────────────────────┐
- *  │  slot (12) │ pad (12)│      length (40)        │
- *  └────────────┴─────────┴────────────────────────┘
- *
- *  slot  : max 4096 (we cap at 1024)
- *  pad   : max 4095 (block alignment residual)
- *  length: max ~1 TiB (more than enough for a slot)
- *
- *  The destination pointer is stored in a side-table indexed by slot.
- */
-
-struct ionic_iouring_flight {
-    unsigned char *dst;
-};
-
-static inline __u64 pack_cookie(unsigned slot, unsigned pad, size_t len)
-{
-    return (((__u64)(slot & 0xFFF)) << 52) |
-           (((__u64)(pad  & 0xFFF)) << 40) |
-           ((__u64)(len & 0xFFFFFFFFFFULL));
-}
-
-static inline void unpack_cookie(__u64 cookie,
-                                 unsigned *slot, unsigned *pad, size_t *len)
-{
-    *slot = (unsigned)(cookie >> 52) & 0xFFF;
-    *pad  = (unsigned)(cookie >> 40) & 0xFFF;
-    *len  = (size_t)(cookie & 0xFFFFFFFFFFULL);
-}
-
-/* ── registered file descriptors (required for SQPOLL) ────────────── */
-
-#define IONIC_IOURING_MAX_FDS 64
-
-struct ionic_fd_table {
-    int     fds[IONIC_IOURING_MAX_FDS];
-    size_t  count;
-};
-
-static void ionic_fd_table_init(struct ionic_fd_table *t)
-{
-    t->count = 0;
-    for (size_t i = 0; i < IONIC_IOURING_MAX_FDS; ++i)
-        t->fds[i] = -1;
-}
-
-/* ── backend structure ────────────────────────────────────────────── */
-
-struct ionic_backend_iouring {
-    struct ionic_backend          base;
-    struct io_uring              *ring;
-    struct ionic_arena            arena;
-    struct ionic_iouring_flight  *flights;  /* indexed by slot */
-    struct ionic_fd_table         fd_table;
-    size_t                        depth;
-    size_t                        inflight;
-};
-
-typedef struct ionic_backend_iouring ionic_backend_iouring_t;
-
-static const struct ionic_backend ionic_iouring_vtable = {
-    .destroy = ionic_iouring_destroy,
-    .read    = ionic_iouring_read,
-};
-
-/* ── helpers ──────────────────────────────────────────────────────── */
-
-static inline size_t align_down(size_t v, size_t a) { return v & ~(a - 1); }
-static inline size_t align_up(size_t v, size_t a)   { return (v + a - 1) & ~(a - 1); }
-
-/*
- * Look up an fd in the registered file table.  If not yet registered,
- * register it now via io_uring_register_files_update.
- * Returns the fixed-file index or -1 on failure.
- */
-static int ionic_iouring_register_fd(struct ionic_context *ctx, struct ionic_backend_iouring *be, int fd)
-{
-    struct ionic_fd_table *t = &be->fd_table;
-
-    for (size_t i = 0; i < t->count; ++i) {
-        if (t->fds[i] == fd)
-            return (int)i;
+static struct ionic_iouring_registered_file *ionic_iouring_engine_find_registered_file(const struct ionic_iouring_engine *engine, const char *path) {
+    for (size_t i = 0; i < engine->config.n_files; ++i) {
+        if (strcmp(path, engine->files[i].path) == 0) return engine->files + i;
     }
 
-    if (t->count >= IONIC_IOURING_MAX_FDS) {
-        IONIC_ERROR(&ctx->logger, IONIC_IOURING_TAG, "fd_table_full max=%d", IONIC_IOURING_MAX_FDS);
-        return -1;
-    }
-
-    int idx = (int)t->count;
-    int ret = io_uring_register_files_update(be->ring, (unsigned)idx, &fd, 1);
-    if (ret < 0) {
-        IONIC_ERROR(&ctx->logger, IONIC_IOURING_TAG, "register_files_update_failed fd=%d idx=%d errno=%d", fd, idx, -ret);
-        return -1;
-    }
-
-    t->fds[idx] = fd;
-    t->count++;
-
-    IONIC_DEBUG(&ctx->logger, IONIC_IOURING_TAG, "fd_registered fd=%d idx=%d total=%zu", fd, idx, t->count);
-    return idx;
+    return NULL;
 }
 
-/* ── queue depth ─────────────────────────────────────────────────── */
+static void ionic_iouring_engine_register_files(struct ionic_context *ctx, struct ionic_iouring_engine *engine) {
+    if (ionic_has_error(&ctx->error)) return;
 
-static unsigned short ionic_iouring_get_queue_depth(struct ionic_context *ctx)
-{
-    char *qd_env = getenv(IONIC_IOURING_QD_ENV_VAR);
-    if (!qd_env) {
-        IONIC_DEBUG(&ctx->logger, IONIC_IOURING_TAG,
-                    "queue_depth_env_not_set env_var=%s default=%u",
-                    IONIC_IOURING_QD_ENV_VAR, IONIC_IOURING_QD_DEFAULT);
-        return IONIC_IOURING_QD_DEFAULT;
-    }
+    const struct ionic_iouring_engine_config *config = &engine->config;
 
-    unsigned long depth = strtoul(qd_env, NULL, 10);
-    if (depth == 0) {
-        IONIC_WARN(&ctx->logger, IONIC_IOURING_TAG,
-                   "queue_depth_env_invalid requested=%lu default=%u",
-                   depth, IONIC_IOURING_QD_DEFAULT);
-        return IONIC_IOURING_QD_DEFAULT;
-    }
-    if (depth > 1024) {
-        IONIC_WARN(&ctx->logger, IONIC_IOURING_TAG,
-                   "queue_depth_env_clamped requested=%lu max=1024", depth);
-        depth = 1024;
-    }
-    return (unsigned short)depth;
-}
+    if (config->n_files > 0)
+    {
+        IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "registering files=%u", config->n_files);
 
-/* ── SQ poll CPU selection ───────────────────────────────────────── */
+        struct ionic_iouring_registered_file *files = calloc(config->n_files, sizeof(struct ionic_iouring_registered_file));
+        int *fds = calloc(config->n_files, sizeof(struct ionic_iouring_registered_file));
+        if (!files || !fds) {
+            if (files) free(files);
+            if (fds) free(fds);
 
-static unsigned short ionic_iouring_get_sq_thread_cpu(struct ionic_context *ctx)
-{
-    FILE *fp = fopen("/proc/stat", "r");
-    if (!fp) {
-        IONIC_WARN(&ctx->logger, IONIC_IOURING_TAG,
-                   "proc_stat_open_failed default_sq_cpu=0");
-        return 0;
-    }
-
-    unsigned short best_cpu = 0;
-    double best_idle_ratio = -1.0;
-    char line[256];
-
-    while (fgets(line, sizeof(line), fp)) {
-        unsigned int cpu_id;
-        unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
-
-        if (strncmp(line, "cpu", 3) != 0 || line[3] == ' ')
-            continue;
-
-        int matched = sscanf(
-            line, "cpu%u %llu %llu %llu %llu %llu %llu %llu %llu",
-            &cpu_id, &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal);
-        if (matched < 5)
-            continue;
-        if (cpu_id >= ctx->topology.num_possible_cpus)
-            continue;
-        if (ctx->topology.node_of_core[cpu_id] == IONIC_NODE_NONE)
-            continue;
-
-        unsigned long long total = user + nice + system + idle;
-        if (matched >= 6) total += iowait;
-        if (matched >= 7) total += irq;
-        if (matched >= 8) total += softirq;
-        if (matched >= 9) total += steal;
-        if (total == 0)
-            continue;
-
-        unsigned long long idle_total = idle;
-        if (matched >= 6) idle_total += iowait;
-
-        double idle_ratio = (double)idle_total / (double)total;
-        if (idle_ratio > best_idle_ratio) {
-            best_idle_ratio = idle_ratio;
-            best_cpu = (unsigned short)cpu_id;
+            ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+            return;
         }
-    }
 
-    fclose(fp);
-    IONIC_DEBUG(&ctx->logger, IONIC_IOURING_TAG,
-                "sq_cpu_selection sq_thread_cpu=%u idle_%=%.1f",
-                best_cpu, best_idle_ratio * 100.0);
-    return best_cpu;
+        for (unsigned i = 0; i < config->n_files; ++i) {
+            const char *file = engine->config.files[i];
+            int fd = open(file, O_RDONLY| O_DIRECT);
+            if (fd < 0) {
+                struct ionic_error err = IONIC_SYS_ERR_WITH_MSG(-fd, "open failed");
+                ionic_set_error(ctx, err);
+                IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING,
+                    "open failed path=%s, res=%u (%s)", file, err.res, strerror(err.res));
+                for (unsigned j = 0; j < i; ++j) close(fds[j]);
+                free(files);
+                free(fds);
+                return;
+            }
+            fds[i] = fd;
+            files[i] = (struct ionic_iouring_registered_file) { file, fd };
+            IONIC_TRACE(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "\t opened file %s, fd=%u", file, fd);
+        }
+
+        int res = io_uring_register_files(&engine->ring, fds, config->n_files);
+        if (res < 0) {
+            struct ionic_error err = IONIC_SYS_ERR_WITH_MSG(res, "io_uring_register_files failed");
+            ionic_set_error(ctx, err);
+            IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING,
+                "io_uring_register_files failed res=%u (%s)", err.res, strerror(err.res));
+            free(files);
+            free(fds);
+            return;
+        }
+        engine->files = files;
+        free(fds);
+
+        IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "registered files n=%u", config->n_files);
+    }
 }
 
-/* ── arena lifecycle ─────────────────────────────────────────────── */
+static void ionic_iouring_engine_register_buffers(struct ionic_context *ctx, struct ionic_iouring_engine *engine) {
+    if (ionic_has_error(&ctx->error)) return;
 
-static int ionic_arena_init(struct ionic_context *ctx, struct ionic_arena *arena, size_t nslots)
-{
-    arena->nslots  = nslots;
-    arena->buf_len = nslots * IONIC_IOURING_SLOT_SIZE;
-    arena->nwords  = (nslots + SLOT_BITS - 1) / SLOT_BITS;
+    const struct ionic_iouring_engine_config config = engine->config;
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "registering staging buffers n=%u, size=%ukiB", config.qd, config.st_size / 1024);
 
-    arena->buf = mmap(NULL, arena->buf_len,
-                      PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
-                      -1, 0);
-
-    if (arena->buf == MAP_FAILED) {
-        IONIC_ERROR(&ctx->logger, IONIC_IOURING_TAG, "arena_mmap_failed size=%zu errno=%d", arena->buf_len, errno);
-        return -1;
+    if (!ionic_is_power_of_two(config.qd)) {
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "invalid queue depth value %hu, needs to be power of two", config.qd);
+        ionic_set_error(ctx, IONIC_ERR_WITH_MSG(IONIC_ERROR_INVALID_VALUE, "qd needs to be power of two"));
+        return;
     }
 
-    arena->free_map = calloc(arena->nwords, sizeof(slotword_t));
-    if (!arena->free_map) {
-        munmap(arena->buf, arena->buf_len);
-        return -1;
+    void *base = ctx->dalloc.allocate(ctx, config.qd * config.st_size, IONIC_ALLOC_STAGING);
+    if (!base) goto ko;
+
+    engine->iovecs = calloc(config.qd, sizeof(struct iovec));
+    if (!engine->iovecs) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+        return;
     }
 
-    for (size_t i = 0; i < nslots; ++i)
-        arena_slot_set_free(arena, i);
+    if (((uintptr_t)base & 0xFF) != 0) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_NOT_ALIGNED));
+        goto ko;
+    }
 
-    IONIC_INFO(&ctx->logger, IONIC_IOURING_TAG, "arena_ready slots=%zu slot_size=%u total=%zu", nslots, IONIC_IOURING_SLOT_SIZE, arena->buf_len);
+    for (unsigned i = 0; i < config.qd; ++i) {
+        engine->iovecs[i].iov_base = base + i * config.st_size;
+        engine->iovecs[i].iov_len  = config.st_size;
+    }
+
+    int res = 0;
+    if ((res = io_uring_register_buffers(&engine->ring, engine->iovecs, engine->config.qd))) {
+        struct ionic_error err = IONIC_SYS_ERR_WITH_MSG(-res, "io_uring_register_buffers failed");
+        ionic_set_error(ctx, err);
+
+        if (err.res == ENOMEM) {
+            struct rlimit rl;
+            getrlimit(RLIMIT_MEMLOCK, &rl);
+            IONIC_WARN(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING,
+                "io_uring_register_buffers failed with ENOMEM (12) is certainly related to RLIMIT_MEMLOCK set too low "
+                "(cur=%lu max=%lu, needed=%zu bytes)", rl.rlim_cur, rl.rlim_max, (size_t)engine->config.qd * 2 * 1024 * 1024
+            );
+        }
+
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "%s, res=%i (%s)", err.what, err.res, strerror(err.res));
+        goto ko;
+    }
+
+    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "registered staging buffers n=%u, size=%ukiB", config.qd, config.st_size / 1024);
+    return;
+
+ko:
+    if (engine->iovecs) free(engine->iovecs);
+    if (base) ctx->dalloc.free(ctx, base, IONIC_ALLOC_STAGING);
+}
+
+
+struct ionic_chunk_key {
+    const char *path;
+    size_t offset;
+};
+
+static int ionic_chunk_key_compare(const void *a, const void *b) {
+    const struct ionic_chunk_key *ka = a, *kb = b;
+    int cmp = strcmp(ka->path, kb->path);
+    if (cmp != 0) return cmp;
+    if (ka->offset < kb->offset) return -1;
+    if (ka->offset > kb->offset) return 1;
     return 0;
 }
 
-static void ionic_arena_destroy(struct ionic_arena *arena)
-{
-    if (arena->buf && arena->buf != MAP_FAILED)
-        munmap(arena->buf, arena->buf_len);
-    free(arena->free_map);
-    arena->buf      = NULL;
-    arena->free_map = NULL;
-}
-
-/* ── completion reaping ──────────────────────────────────────────── */
-
-/*
- * Drain up to `max` completions.  For each CQE the useful payload
- * (skipping the O_DIRECT alignment padding) is copied to the
- * destination that was recorded before submission, then the slot is
- * returned to the arena.
- *
- * *bytes_out is incremented by the number of useful bytes copied.
- * Returns the number of completions reaped.
- */
-static size_t ionic_iouring_reap(struct ionic_context *ctx, struct ionic_backend_iouring *be, unsigned max, int block, size_t *bytes_out)
-{
-    struct io_uring_cqe *cqe;
-    size_t reaped = 0;
-
-    for (unsigned i = 0; i < max; ++i) {
-        int ret;
-        if (block && i == 0)
-            ret = io_uring_wait_cqe(be->ring, &cqe);
+static ssize_t ionic_chunk_key_bsearch(const struct ionic_chunk_key *keys, size_t n, const char *path, size_t offset) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(keys[mid].path, path);
+        if (cmp < 0 || (cmp == 0 && keys[mid].offset < offset))
+            lo = mid + 1;
+        else if (cmp > 0 || (cmp == 0 && keys[mid].offset > offset))
+            hi = mid;
         else
-            ret = io_uring_peek_cqe(be->ring, &cqe);
-
-        if (ret < 0)
-            break;
-
-        unsigned slot, pad;
-        size_t len;
-        unpack_cookie(cqe->user_data, &slot, &pad, &len);
-
-        if (cqe->res < 0) {
-            IONIC_ERROR(&ctx->logger, IONIC_IOURING_TAG,
-                        "cqe_error slot=%u res=%d", slot, cqe->res);
-        } else {
-            size_t avail = (size_t)cqe->res > pad
-                           ? (size_t)cqe->res - pad : 0;
-            size_t to_copy = avail < len ? avail : len;
-
-            if (to_copy > 0) {
-                unsigned char *src = arena_slot_ptr(&be->arena, slot) + pad;
-                memcpy(be->flights[slot].dst, src, to_copy);
-            }
-
-            *bytes_out += to_copy;
-
-            IONIC_TRACE(&ctx->logger, IONIC_IOURING_TAG,
-                        "cqe_ok slot=%u pad=%u len=%zu res=%d copied=%zu dst=%p",
-                        slot, pad, len, cqe->res, to_copy,
-                        (void *)be->flights[slot].dst);
-        }
-
-        io_uring_cqe_seen(be->ring, cqe);
-        arena_slot_set_free(&be->arena, slot);
-        be->inflight--;
-        reaped++;
+            return (ssize_t)mid;
     }
-    return reaped;
+    return -1;
 }
 
-/* ── public: read ─────────────────────────────────────────────────── */
-
-size_t ionic_iouring_read(struct ionic_context *ctx, int fd, unsigned char *dst, size_t len, size_t offset)
+static size_t ionic_iouring_engine_get_seq_chunks(
+    struct ionic_context *ctx,
+    struct ionic_iouring_engine *engine,
+    struct ionic_logical_segment *segments,
+    size_t count,
+    struct ionic_io_fetch_result **out)
 {
-    struct ionic_backend_iouring *be = (struct ionic_backend_iouring *)ctx->backend;
+    const size_t st_size = engine->config.st_size;
 
-    IONIC_DEBUG(&ctx->logger, IONIC_IOURING_TAG, "read fd=%d dst=%p len=%zu offset=%zu", fd, dst, len, offset);
-
-    int fixed_fd = ionic_iouring_register_fd(ctx, be, fd);
-    if (fixed_fd < 0) {
-        ctx->error = IONIC_ERR_WITH_MSG(IONIC_ERROR_BACKEND_INITIALIZATION_FAILED, "failed to register fd for SQPOLL");
+    if (count == 0) {
+        *out = NULL;
         return 0;
     }
 
-    size_t total_read = 0;
-    size_t pos = 0;
-
-    while (pos < len) {
-        size_t file_off    = offset + pos;
-        size_t aligned_off = align_down(file_off, IONIC_IOURING_BLOCK_SIZE);
-        size_t pad         = file_off - aligned_off;
-        size_t remaining   = len - pos;
-        size_t chunk       = remaining;
-
-        if (chunk + pad > IONIC_IOURING_SLOT_SIZE)
-            chunk = IONIC_IOURING_SLOT_SIZE - pad;
-
-        size_t io_len = align_up(pad + chunk, IONIC_IOURING_BLOCK_SIZE);
-
-        size_t slot = arena_slot_acquire(&be->arena);
-        while (slot == (size_t)-1) {
-            ionic_iouring_reap(ctx, be, 1, /*block=*/1, &total_read);
-            slot = arena_slot_acquire(&be->arena);
-        }
-
-        be->flights[slot].dst = dst + pos;
-
-        struct io_uring_sqe *sqe = io_uring_get_sqe(be->ring);
-        while (!sqe) {
-            io_uring_submit(be->ring);
-            ionic_iouring_reap(ctx, be, be->depth, /*block=*/0, &total_read);
-            sqe = io_uring_get_sqe(be->ring);
-        }
-
-        io_uring_prep_read_fixed(sqe, fixed_fd, arena_slot_ptr(&be->arena, slot), io_len, aligned_off, /*buf_index=*/0);
-        
-        sqe->flags |= IOSQE_FIXED_FILE;
-        sqe->user_data = pack_cookie((unsigned)slot, (unsigned)pad, chunk);
-        be->inflight++;
-        pos += chunk;
-
-        IONIC_TRACE(&ctx->logger, IONIC_IOURING_TAG,
-                    "sqe slot=%zu file_off=%zu aligned=%zu pad=%zu "
-                    "io_len=%zu chunk=%zu inflight=%zu",
-                    slot, file_off, aligned_off, pad, io_len, chunk, be->inflight);
-
-        if (be->inflight >= be->depth / 2)
-            io_uring_submit(be->ring);
+    size_t max_keys = 0;
+    for (size_t i = 0; i < count; ++i) {
+        size_t aligned_from = ionic_align_down_sz(segments[i].from, st_size);
+        size_t aligned_to = ionic_align_up_sz(segments[i].to, st_size);
+        max_keys += (aligned_to - aligned_from + st_size - 1) / st_size;
     }
 
-    io_uring_submit(be->ring);
-    while (be->inflight > 0)
-        ionic_iouring_reap(ctx, be, be->depth, /*block=*/1, &total_read);
+    if (max_keys == 0) {
+        *out = NULL;
+        return 0;
+    }
 
-    IONIC_DEBUG(&ctx->logger, IONIC_IOURING_TAG, "read_done fd=%d requested=%zu got=%zu", fd, len, total_read);
+    struct ionic_chunk_key *keys = calloc(max_keys, sizeof(*keys));
+    if (!keys) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+        return 0;
+    }
 
-    return total_read;
+    size_t n_keys = 0;
+    for (size_t i = 0; i < count; ++i) {
+        size_t aligned_from = ionic_align_down_sz(segments[i].from, st_size);
+        size_t aligned_to = ionic_align_up_sz(segments[i].to, st_size);
+        for (size_t offset = aligned_from; offset < aligned_to; offset += st_size) {
+            keys[n_keys++] = (struct ionic_chunk_key){ segments[i].path, offset };
+        }
+    }
+
+    qsort(keys, n_keys, sizeof(*keys), ionic_chunk_key_compare);
+
+    size_t n_unique = 0;
+    for (size_t i = 0; i < n_keys; ++i) {
+        if (n_unique == 0 || ionic_chunk_key_compare(&keys[i], &keys[n_unique - 1]) != 0) {
+            keys[n_unique++] = keys[i];
+        }
+    }
+
+    *out = calloc(n_unique, sizeof(struct ionic_io_fetch_result));
+    if (!*out) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+        free(keys);
+        return 0;
+    }
+
+    for (size_t c = 0; c < n_unique; ++c) {
+        (*out)[c] = (struct ionic_io_fetch_result){
+            .path = keys[c].path,
+            .offset = keys[c].offset,
+            .len = st_size,
+            .entries = NULL,
+            .n_entries = 0,
+            .userdata = ULONG_MAX,
+        };
+    }
+
+    size_t *entry_counts = calloc(n_unique, sizeof(size_t));
+    if (!entry_counts) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+        for (size_t c = 0; c < n_unique; ++c) free((*out)[c].entries);
+        free(*out);
+        *out = NULL;
+        free(keys);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        const struct ionic_logical_segment *seg = &segments[i];
+        size_t aligned_from = ionic_align_down_sz(seg->from, st_size);
+        size_t aligned_to = ionic_align_up_sz(seg->to, st_size);
+
+        for (size_t offset = aligned_from; offset < aligned_to; offset += st_size) {
+            ssize_t idx = ionic_chunk_key_bsearch(keys, n_unique, seg->path, offset);
+            if (idx < 0) continue;
+
+            size_t overlap_start = seg->from > offset ? seg->from : offset;
+            size_t overlap_end = seg->to < (offset + st_size) ? seg->to : (offset + st_size);
+            if (overlap_start >= overlap_end) continue;
+
+            entry_counts[idx]++;
+        }
+    }
+
+    for (size_t c = 0; c < n_unique; ++c) {
+        if (entry_counts[c] > 0) {
+            (*out)[c].entries = calloc(entry_counts[c], sizeof(struct ionic_scatter_entry));
+            (*out)[c].n_entries = entry_counts[c];
+            if (!(*out)[c].entries) {
+                ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+                for (size_t j = 0; j < c; ++j) free((*out)[j].entries);
+                free(*out);
+                *out = NULL;
+                free(entry_counts);
+                free(keys);
+                return 0;
+            }
+        }
+    }
+
+    size_t *fill_idx = calloc(n_unique, sizeof(size_t));
+    if (!fill_idx) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
+        for (size_t c = 0; c < n_unique; ++c) free((*out)[c].entries);
+        free(*out);
+        *out = NULL;
+        free(entry_counts);
+        free(keys);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        const struct ionic_logical_segment *seg = &segments[i];
+        size_t aligned_from = ionic_align_down_sz(seg->from, st_size);
+        size_t aligned_to = ionic_align_up_sz(seg->to, st_size);
+
+        for (size_t offset = aligned_from; offset < aligned_to; offset += st_size) {
+            ssize_t idx = ionic_chunk_key_bsearch(keys, n_unique, seg->path, offset);
+            if (idx < 0) continue;
+
+            size_t overlap_start = seg->from > offset ? seg->from : offset;
+            size_t overlap_end = seg->to < (offset + st_size) ? seg->to : (offset + st_size);
+            if (overlap_start >= overlap_end) continue;
+
+            struct ionic_io_fetch_result *result = &(*out)[idx];
+            size_t ei = fill_idx[idx]++;
+            result->entries[ei] = (struct ionic_scatter_entry){
+                .staging_offset = overlap_start - offset,
+                .len = overlap_end - overlap_start,
+                .dst = seg->dst ? (char *)seg->dst + (overlap_start - seg->from) : NULL,
+                .userdata = seg->userdata,
+            };
+        }
+    }
+
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING,
+        "computed seq chunks: segments=%zu, chunks=%zu", count, n_unique);
+
+    free(fill_idx);
+    free(entry_counts);
+    free(keys);
+    return n_unique;
 }
 
-/* ── public: destroy ──────────────────────────────────────────────── */
 
-void ionic_iouring_destroy(struct ionic_context *ctx)
-{
-    struct ionic_backend_iouring *be =
-        (struct ionic_backend_iouring *)ctx->backend;
-
-    io_uring_unregister_buffers(be->ring);
-    ionic_arena_destroy(&be->arena);
-    free(be->flights);
-    io_uring_queue_exit(be->ring);
-    free(be->ring);
-    free(be);
-    ctx->backend = NULL;
-    IONIC_INFO(&ctx->logger, IONIC_IOURING_TAG, "destroyed");
+static void ionic_iouring_engine_destroy(struct ionic_ioengine *engine) {
+    struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
+    if (engine_->results) {
+        for (size_t i = 0; i < engine_->config.qd; ++i)
+            if (engine_->results[i].entries) free(engine_->results[i].entries);
+        free(engine_->results);
+    }
 }
 
-/* ── public: init ─────────────────────────────────────────────────── */
+static void ionic_iouring_engine_init(struct ionic_context *ctx, struct ionic_ioengine *engine) {
+    if (ionic_has_error(&ctx->error)) return;
 
-void ionic_iouring_init(struct ionic_context *ctx)
-{
-    ionic_backend_iouring_t *be = calloc(1, sizeof(*be));
-    if (!be) {
-        ctx->error = IONIC_ERR_WITH_MSG(IONIC_ERROR_ALLOCATION_FAILED, "failed to allocate io-uring backend");
+    struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
+
+    if (engine_->config.qd == 0) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_INVALID_VALUE));
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "invalid queue depth == 0 (got %u)", engine_->config.qd);
         return;
     }
 
-    be->depth = ionic_iouring_get_queue_depth(ctx);
-
-    be->ring = malloc(sizeof(struct io_uring));
-    if (!be->ring) {
-        free(be);
-        ctx->error = IONIC_ERR_WITH_MSG(IONIC_ERROR_ALLOCATION_FAILED, "failed to allocate io-uring ring");
+    if (engine_->config.qd > 64) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_INVALID_VALUE));
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "invalid queue depth should < 64 (got %u)", engine_->config.qd);
         return;
     }
 
-    unsigned short sq_cpu = ionic_iouring_get_sq_thread_cpu(ctx);
-    struct io_uring_params params = {
-        .flags         = IORING_SETUP_SQPOLL,
-        .sq_thread_cpu = sq_cpu,
-        .sq_thread_idle = 1000,
-    };
-
-    int ret = io_uring_queue_init_params(be->depth, be->ring, &params);
-    if (ret < 0) {
-        free(be->ring);
-        free(be);
-        ctx->error = IONIC_ERR_WITH_MSG(IONIC_ERROR_BACKEND_INITIALIZATION_FAILED, "io_uring_queue_init_params failed");
+    if (__builtin_popcount(engine_->config.qd) > 1) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_INVALID_VALUE));
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "invalid queue depth should be a power of 2 (got %u)", engine_->config.qd);
         return;
     }
 
-    /* Arena: one slot per SQ entry so every in-flight op has guaranteed space. */
-    if (ionic_arena_init(ctx, &be->arena, be->depth) < 0) {
-        io_uring_queue_exit(be->ring);
-        free(be->ring);
-        free(be);
-        ctx->error = IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED);
+    engine_->slots = ULONG_MAX; // TODO(mfuntowicz): use a mask to the number of actual slots from config->qd
+    atomic_store_explicit(&engine_->pending, 0, memory_order_relaxed);
+    atomic_store_explicit(&engine_->done, 0, memory_order_relaxed);
+
+    engine_->results = calloc(engine_->config.qd, sizeof(struct ionic_io_fetch_result));
+    if (!engine_->results) {
+        ionic_set_error(ctx, IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED));
         return;
     }
 
-    /* Register the arena as a single fixed buffer. */
-    struct iovec iov = {
-        .iov_base = be->arena.buf,
-        .iov_len  = be->arena.buf_len,
-    };
-    ret = io_uring_register_buffers(be->ring, &iov, 1);
-    if (ret < 0)
-        IONIC_WARN(&ctx->logger, IONIC_IOURING_TAG, "register_buffers_failed errno=%d (continuing without fixed buffers)", -ret);
+    io_uring_queue_init_params(engine_->config.qd, &engine_->ring, &engine_->config.params);
+    ionic_iouring_engine_register_files(ctx, engine_);
+    ionic_iouring_engine_register_buffers(ctx, engine_);
 
-    /* Pre-register a sparse fd table so fds can be added at read time. */
-    ionic_fd_table_init(&be->fd_table);
-    ret = io_uring_register_files_sparse(be->ring, IONIC_IOURING_MAX_FDS);
-    if (ret < 0) {
-        IONIC_WARN(&ctx->logger, IONIC_IOURING_TAG, "register_files_sparse_failed errno=%d (SQPOLL may not work)", -ret);
+    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "initialized ring");
+}
+
+static size_t ionic_iouring_engine_fetch(
+    struct ionic_context *ctx, struct ionic_ioengine *engine, struct ionic_logical_segment *segments, const size_t count) {
+
+    if (ionic_has_error(&ctx->error)) return 0;
+
+    struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
+    struct ionic_io_fetch_result *results;
+    const size_t n_chunks = ionic_iouring_engine_get_seq_chunks(ctx, engine_, segments, count, &results);
+
+    if (ionic_has_error(&ctx->error)) return 0;
+
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "fetch segments=%zu, chunks=%zu", count, n_chunks);
+
+    unsigned long *slots = &engine_->slots;
+    struct iovec *iovecs = engine_->iovecs;
+    struct io_uring_cqe **cqes = calloc(engine_->config.qd, sizeof(struct io_uring_cqe *));
+    struct io_uring *ring = &engine_->ring;
+
+    size_t submitted = 0, completed = 0;
+    do {
+        unsigned char has_new_entries = 0;
+        while (submitted < n_chunks) {
+            const int slot = get_slot_available(slots);
+            if (slot < 0) break;
+
+            struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+            if (!sqe) break;
+
+            mark_slot_busy(slots, slot);
+
+            struct iovec dst = iovecs[slot];
+            struct ionic_io_fetch_result *res = results + submitted;
+            struct ionic_iouring_registered_file *file = ionic_iouring_engine_find_registered_file(engine_, res->path);
+            if (!file) {
+                ionic_set_error(ctx, IONIC_ERR_WITH_MSG(IONIC_ERROR_IOENGINE_INVALID_PARAMETER, "file not registered"));
+                goto cleanup;
+            }
+
+            sqe->user_data = (unsigned long)slot;
+            res->userdata = (unsigned long)slot;
+            res->data = dst.iov_base;
+            if (engine_->results[slot].entries) {
+                free(engine_->results[slot].entries);
+            }
+            engine_->results[slot] = *res;
+
+            io_uring_prep_read_fixed(sqe, file->fd, dst.iov_base, res->len, res->offset, slot);
+            ++submitted;
+            has_new_entries = 1;
+        }
+
+        if (has_new_entries)
+            io_uring_submit(ring);
+
+        const unsigned n_ready = io_uring_peek_batch_cqe(ring, cqes, engine_->config.qd);
+        if (n_ready > 0) {
+            completed += n_ready;
+            for (unsigned i = 0; i < n_ready; ++i) {
+                struct io_uring_cqe *cqe = cqes[i];
+                const unsigned long slot = cqe->user_data;
+
+                if (slot < engine_->config.qd)
+                    atomic_set_bit(&engine_->pending, slot); // inform dma worker some are pending
+
+                io_uring_cqe_seen(ring, cqe);  // release iouring cqe marking for reuse
+            }
+        }
+
+        unsigned long ready;
+        while ((ready = atomic_load_explicit(&engine_->done, memory_order_acquire))) {
+            if (has_slot_available(ready)) {
+                unsigned long slot = get_slot_available(&ready);
+                atomic_clear_bit(&engine_->done, slot);
+                set_slot_available(slots, slot);
+            }
+        }
+    } while (completed < n_chunks);
+
+cleanup:
+    if (cqes) free(cqes);
+    if (results) {
+        for (size_t i = submitted; i < n_chunks; ++i)
+            if (results[i].entries) free(results[i].entries);
+        free(results);
     }
 
-    be->flights = calloc(be->depth, sizeof(*be->flights));
-    if (!be->flights) {
-        io_uring_unregister_buffers(be->ring);
-        ionic_arena_destroy(&be->arena);
-        io_uring_queue_exit(be->ring);
-        free(be->ring);
-        free(be);
-        ctx->error = IONIC_ERR(IONIC_ERROR_ALLOCATION_FAILED);
+    return completed;
+}
+
+static size_t ionic_iouring_engine_peek(struct ionic_context *ctx, struct ionic_ioengine *engine, struct ionic_io_fetch_result **res, size_t count) {
+    struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
+    unsigned long pending = atomic_load_explicit(&engine_->pending, memory_order_acquire);;
+
+    if (pending == 0) return 0;
+
+    size_t filled = 0;
+    while (pending && filled < count) {
+        int slot = get_slot_available(&pending);
+        res[filled] = &engine_->results[slot];
+
+        atomic_clear_bit(&engine_->pending, slot);
+        pending = atomic_load_explicit(&engine_->pending, memory_order_acquire);
+        ++filled;
+    }
+
+    return filled;
+}
+
+static void ionic_iouring_engine_mark_done(struct ionic_context *ctx, struct ionic_ioengine *engine, const struct ionic_io_fetch_result *res) {
+    struct ionic_iouring_engine *engine_ = (struct ionic_iouring_engine *)engine;
+    const unsigned long slot = (unsigned long)res->userdata;
+    atomic_set_bit(&engine_->done, slot);
+
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "slot done slot=%u", slot);
+}
+
+static void ionic_iouring_engine_probe_ring(struct ionic_context *ctx, struct io_uring_params *params, unsigned qd) {
+    struct io_uring ring;
+    int res = 0;
+
+    params->flags |= IORING_SETUP_SQPOLL;
+    if ((res = io_uring_queue_init_params(qd, &ring, params))) {
+        struct ionic_error err = IONIC_SYS_ERR_WITH_MSG(-res, "io_uring_queue_init_params failed");
+        ionic_set_error(ctx, err);
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "io_uring_queue_init failed flags=IORING_SETUP_SQPOLL res=%i (%s)", err.res, strerror(err.res));
         return;
     }
 
-    be->base = ionic_iouring_vtable;
-    ctx->backend = &be->base;
+    struct io_uring_probe *probe = io_uring_get_probe_ring(&ring);
+    if (!probe)
+        return;
 
-    IONIC_INFO(&ctx->logger, IONIC_IOURING_TAG,
-               "ready qd=%zu sq_thread_cpu=%u sq_thread_idle=%u "
-               "arena_slots=%zu arena_size=%zu slot_size=%u",
-               be->depth, params.sq_thread_cpu, params.sq_thread_idle,
-               be->arena.nslots, be->arena.buf_len, IONIC_IOURING_SLOT_SIZE);
+    if (!io_uring_opcode_supported(probe, IORING_OP_READ)) {
+        struct ionic_error err = IONIC_ERR_WITH_MSG(IONIC_ERROR_UNSUPPORTED, "probe failed feature=IORING_OP_READ not supported");
+        ionic_set_error(ctx, err);
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, err.what);
+        io_uring_free_probe(probe);
+        return;
+    }
+
+    if (!io_uring_opcode_supported(probe, IORING_OP_READ_FIXED)) {
+        struct ionic_error err = IONIC_ERR_WITH_MSG(IONIC_ERROR_UNSUPPORTED, "probe failed feature=IORING_OP_READ_FIXED not supported");
+        ionic_set_error(ctx, err);
+        IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, err.what);
+        io_uring_free_probe(probe);
+        return;
+    }
+
+    io_uring_free_probe(probe);
+}
+
+struct ionic_iouring_engine *ionic_iouring_engine_create(struct ionic_context *ctx, struct ionic_iouring_engine_config *config) {
+    if (ionic_has_error(&ctx->error)) goto ko;
+    IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_IOENGINE_IOURING, "create qd=%hu", config->qd);
+
+    ionic_iouring_engine_probe_ring(ctx, &config->params, config->qd);
+    if (ionic_has_error(&ctx->error)) goto ko;
+
+    struct ionic_iouring_engine *engine = malloc(sizeof(struct ionic_iouring_engine));
+    engine->config             = *config;
+    engine->base.initialize    = ionic_iouring_engine_init;
+    engine->base.destroy       = ionic_iouring_engine_destroy;
+    engine->base.fetch         = ionic_iouring_engine_fetch;
+    engine->base.peek          = ionic_iouring_engine_peek;
+    engine->base.mark_done     = ionic_iouring_engine_mark_done;
+
+    return engine;
+ko:
+    return NULL;
 }
