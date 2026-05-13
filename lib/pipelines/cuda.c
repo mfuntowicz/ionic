@@ -257,8 +257,8 @@ static size_t ionic_pipeline_cuda_scheduler_loop(
 
     size_t n_bytes = 0;
     for (size_t i = 0; i < plan->n; ++i) {
-        const struct ionic_tensor *t = plan->tensors[i].tensor;
-        n_bytes += t->end - t->start;
+        struct ionic_sharded_tensor_specs *specs = plan->tensors[i].specs + rank;
+        n_bytes += specs->end - specs->start;
     }
 
     if (n_bytes == 0) return 0;
@@ -289,12 +289,12 @@ static size_t ionic_pipeline_cuda_scheduler_loop(
         atomic_store_explicit(&specs->loaded, 0, memory_order_relaxed);
         segments[i] = (struct ionic_logical_segment){
             .path = t->file,
-            .from = t->start,
-            .to = t->end,
+            .from = specs->start,
+            .to = specs->end,
             .dst = (char *)device_buffer + running_offset,
             .userdata = specs,
         };
-        running_offset += t->end - t->start;
+        running_offset += specs->end - specs->start;
     }
 
     struct ionic_iouring_engine *iouring_engine = (struct ionic_iouring_engine *)pipeline->ioengine;
