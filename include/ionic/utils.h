@@ -23,6 +23,35 @@ static inline size_t ionic_tensor_nbytes(const struct ionic_tensor *tensor) {
     return tensor->end - tensor->start;
 }
 
+static inline size_t ionic_dtype_size(ionic_data_type_t dtype) {
+    switch (dtype) {
+        case IONIC_DATA_TYPE_FLOAT32:
+        case IONIC_DATA_TYPE_SIGNED_INT32:
+        case IONIC_DATA_TYPE_UNSIGNED_INT32:
+            return 4;
+        case IONIC_DATA_TYPE_FLOAT64:
+        case IONIC_DATA_TYPE_SIGNED_INT64:
+        case IONIC_DATA_TYPE_UNSIGNED_INT64:
+            return 8;
+        case IONIC_DATA_TYPE_FLOAT16:
+        case IONIC_DATA_TYPE_BFLOAT16:
+        case IONIC_DATA_TYPE_SIGNED_INT16:
+        case IONIC_DATA_TYPE_UNSIGNED_INT16:
+            return 2;
+        case IONIC_DATA_TYPE_BOOL:
+        case IONIC_DATA_TYPE_FLOAT8_E5M2:
+        case IONIC_DATA_TYPE_FLOAT8_E4M3:
+        case IONIC_DATA_TYPE_FLOAT8_E8M0:
+        case IONIC_DATA_TYPE_SIGNED_INT8:
+        case IONIC_DATA_TYPE_UNSIGNED_INT8:
+            return 1;
+        case IONIC_DATA_TYPE_COMPLEX:
+            return 8;
+        default:
+            return 1;
+    }
+}
+
 static inline unsigned char ionic_is_power_of_two(const unsigned int n) { return n && !(n & (n - 1)); }
 static inline size_t ionic_align_down_sz(const size_t v, const size_t a) { return v & ~(a - 1); }
 static inline size_t ionic_align_up_sz(const size_t v, const size_t a) { return (v + a - 1) & ~(a - 1); }
