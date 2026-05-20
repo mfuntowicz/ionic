@@ -72,7 +72,10 @@ IONIC_EXTERN void *ionic_allocate_device(struct ionic_context *, size_t, enum io
 IONIC_EXTERN void ionic_free_host(struct ionic_context *, void *, enum ionic_allocation_kind) NO_EXCEPT;
 IONIC_EXTERN void ionic_free_device(struct ionic_context *, void *, enum ionic_allocation_kind) NO_EXCEPT;
 
+#define IONIC_GROUP_MAX_LEN 32
+
 struct ionic_context {
+    char   group[IONIC_GROUP_MAX_LEN];
     struct ionic_error  error;
     struct ionic_device device;
     struct ionic_allocator halloc;
@@ -84,7 +87,7 @@ struct ionic_context {
 typedef struct ionic_context ionic_context_t;
 
 IONIC_EXTERN void ionic_allocator_init(struct ionic_context *, struct ionic_device) NO_EXCEPT;
-IONIC_EXTERN void ionic_context_init(struct ionic_context *, struct ionic_device) NO_EXCEPT;
+IONIC_EXTERN void ionic_context_init(struct ionic_context *, struct ionic_device, const char *gid) NO_EXCEPT;
 IONIC_EXTERN void ionic_context_destroy(struct ionic_context *) NO_EXCEPT;
 
 IONIC_EXTERN IONIC_INLINE void ionic_set_error(struct ionic_context *ctx, struct ionic_error error) NO_EXCEPT { ctx->error = error; };

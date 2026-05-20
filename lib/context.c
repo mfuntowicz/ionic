@@ -2,6 +2,7 @@
 #include "ionic/error.h"
 #include "ionic/ionic.h"
 #include "ionic/topology.h"
+#include <string.h>
 
 #ifdef __IONIC_CUDA_ENABLED__
 #include <ionic/devices/cuda.h>
@@ -42,9 +43,16 @@ void ionic_allocator_init(struct ionic_context *ctx, struct ionic_device device)
     }
 }
 
-void ionic_context_init(struct ionic_context *ctx, struct ionic_device device) {
+void ionic_context_init(struct ionic_context *ctx, struct ionic_device device, const char *group) {
     ctx->error = IONIC_SUCCESS;
     ctx->device = device;
+
+    if (group) {
+        strncpy(ctx->group, group, IONIC_GROUP_MAX_LEN - 1);
+        ctx->group[IONIC_GROUP_MAX_LEN - 1] = '\0';
+    } else {
+        ctx->group[0] = '\0';
+    }
 
     ionic_logger_init(&ctx->logger);
     ionic_allocator_init(ctx, device);
@@ -64,7 +72,7 @@ void ionic_context_init(struct ionic_context *ctx, struct ionic_device device) {
     }
 #endif
 
-    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_CONTEXT, "initialized");
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_CONTEXT, "initialized group=%s", group ? group : "(null)");
 }
 
 void ionic_context_destroy(ionic_context_t *ctx) {
