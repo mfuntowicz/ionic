@@ -4,7 +4,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include "ionic/types.h"
+#include "ionic/ionic.h"
 #include "ionic/utils.h"
 
 #define IONIC_HOST_MAP_MAGIC 0x31434948u /* "HIC1" little-endian tag */

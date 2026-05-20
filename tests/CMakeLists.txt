@@ -17,3 +17,8 @@ add_executable(test_planner planner.c)
 target_link_libraries(test_planner PRIVATE ionic)
 target_include_directories(test_planner PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME test_planner COMMAND test_planner)
+
+add_executable(test_barrier barrier.c)
+target_link_libraries(test_barrier PRIVATE ionic)
+target_include_directories(test_barrier PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME test_barrier COMMAND test_barrier)

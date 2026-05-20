@@ -15,6 +15,7 @@ option(IONIC_ENABLE_SAFETENSORS "Enable Safetensors support" OFF)
 
 set(IONIC_LIBS "NUMA::numa")
 set(IONIC_SOURCES
+    lib/barrier.c
     lib/context.c
     lib/memory.c
     lib/logging.c
@@ -43,6 +44,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND IONIC_SOURCES lib/platform/linux/iouring.c)
     list(APPEND IONIC_LIBS liburing_static)
     add_compile_definitions(_GNU_SOURCE)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+    list(APPEND IONIC_HEADERS include/ionic/platform/posix/shm.h)
+    list(APPEND IONIC_SOURCES lib/platform/posix/shm.c)
+    list(APPEND IONIC_LIBS rt)
 endif()
 
 if(IONIC_ENABLE_CUDA)

@@ -72,8 +72,6 @@ IONIC_EXTERN void *ionic_allocate_device(struct ionic_context *, size_t, enum io
 IONIC_EXTERN void ionic_free_host(struct ionic_context *, void *, enum ionic_allocation_kind) NO_EXCEPT;
 IONIC_EXTERN void ionic_free_device(struct ionic_context *, void *, enum ionic_allocation_kind) NO_EXCEPT;
 
-IONIC_EXTERN void ionic_barrier_wait(struct ionic_barrier *) NO_EXCEPT;
-
 struct ionic_context {
     struct ionic_error  error;
     struct ionic_device device;
@@ -96,7 +94,6 @@ IONIC_EXTERN IONIC_INLINE unsigned char ionic_has_error(struct ionic_error *erro
 IONIC_EXTERN struct ionic_planner *ionic_planner_init(struct ionic_context *, size_t num_tensors, unsigned short rank, unsigned short world_size) NO_EXCEPT;
 IONIC_EXTERN void ionic_planner_destroy(struct ionic_planner *) NO_EXCEPT;
 IONIC_EXTERN void ionic_planner_shard(struct ionic_context *, struct ionic_planner *, const struct ionic_tensor *, enum ionic_sharding_kind) NO_EXCEPT;
-IONIC_EXTERN void ionic_planner_execute_plan(struct ionic_context *, struct ionic_planner *, struct ionic_sharding_plan *) NO_EXCEPT;
 IONIC_EXTERN struct ionic_sharding_plan ionic_planner_materialize_plan(struct ionic_context *, struct ionic_planner *) NO_EXCEPT;
 IONIC_EXTERN void ionic_sharding_plan_destroy(struct ionic_context *, struct ionic_sharding_plan *) NO_EXCEPT;
 
