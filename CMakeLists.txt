@@ -15,7 +15,7 @@ option(IONIC_ENABLE_SAFETENSORS "Enable Safetensors support" OFF)
 
 set(IONIC_LIBS "NUMA::numa")
 set(IONIC_SOURCES
-    lib/barrier.c
+    lib/group.c
     lib/context.c
     lib/memory.c
     lib/logging.c
@@ -80,6 +80,7 @@ target_include_directories(ionic PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
+target_include_directories(ionic PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib)
 
 if(IONIC_BUILD_EXAMPLES)
     add_subdirectory(examples)

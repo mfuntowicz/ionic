@@ -1,6 +1,7 @@
 #ifndef IONIC_PLANNER_H
 #define IONIC_PLANNER_H
 
+#include <stdatomic.h>
 #include "ionic/types.h"
 
 #define IONIC_EVENT_TAG_PLANNER "planner"

@@ -2,7 +2,9 @@
 #include "ionic/error.h"
 #include "ionic/ionic.h"
 #include "ionic/topology.h"
+#include "group.h"
 #include <string.h>
+#include <stdio.h>
 
 #ifdef __IONIC_CUDA_ENABLED__
 #include <ionic/devices/cuda.h>
@@ -43,9 +45,11 @@ void ionic_allocator_init(struct ionic_context *ctx, struct ionic_device device)
     }
 }
 
-void ionic_context_init(struct ionic_context *ctx, struct ionic_device device, const char *group) {
+void ionic_context_init(struct ionic_context *ctx, struct ionic_device device, const char *group, unsigned short rank, unsigned short world_size) {
     ctx->error = IONIC_SUCCESS;
     ctx->device = device;
+    ctx->rank = rank;
+    ctx->world_size = world_size;
 
     if (group) {
         strncpy(ctx->group, group, IONIC_GROUP_MAX_LEN - 1);
@@ -55,8 +59,19 @@ void ionic_context_init(struct ionic_context *ctx, struct ionic_device device, c
     }
 
     ionic_logger_init(&ctx->logger);
-    ionic_allocator_init(ctx, device);
     ionic_topology_init(ctx);
+
+    if (group && world_size > 1) {
+        char pg_name[IONIC_GROUP_MAX_IDENT];
+        snprintf(pg_name, sizeof(pg_name), "/ionic_pg_%s", group);
+        ctx->pg = (rank == 0)
+            ? ionic_group_create(ctx, pg_name, (unsigned char)world_size)
+            : ionic_group_open(ctx, pg_name, (unsigned char)world_size);
+    } else {
+        ctx->pg = NULL;
+    }
+
+    ionic_allocator_init(ctx, device);
 
 #ifdef __IONIC_CUDA_ENABLED__
     if (device.kind != IONIC_DEVICE_CPU && device.kind != IONIC_DEVICE_CUDA) {
@@ -72,10 +87,18 @@ void ionic_context_init(struct ionic_context *ctx, struct ionic_device device, c
     }
 #endif
 
-    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_CONTEXT, "initialized group=%s", group ? group : "(null)");
+    IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_CONTEXT, "initialized group=%s rank=%hu world_size=%hu",
+        group ? group : "(null)", rank, world_size);
 }
 
 void ionic_context_destroy(ionic_context_t *ctx) {
+    if (ctx->pg) {
+        if (ctx->rank == 0)
+            ionic_group_destroy(ctx->pg);
+        else
+            ionic_group_close(ctx->pg);
+        ctx->pg = NULL;
+    }
     ionic_topology_destroy(ctx);
     IONIC_DEBUG(&ctx->logger, IONIC_EVENT_TAG_CONTEXT, "destroyed");
 }

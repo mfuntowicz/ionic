@@ -6,6 +6,7 @@
 #include <ionic/engine.h>
 #include <ionic/pipelines/cuda.h>
 #include <ionic/logging.h>
+#include "group.h"
 #include "ionic/utils.h"
 
 #ifdef __linux__
@@ -250,10 +251,11 @@ static int ionic_pipeline_cuda_dma_worker(void *arg) {
 static size_t ionic_pipeline_cuda_scheduler_loop(
     struct ionic_context *ctx,
     struct ionic_pipeline_cuda *pipeline,
-    const struct ionic_sharding_plan *plan,
-    const unsigned short rank)
+    const struct ionic_sharding_plan *plan)
 {
     if (ionic_has_error(&ctx->error)) return 0;
+
+    const unsigned short rank = ctx->rank;
 
     size_t n_bytes = 0;
     for (size_t i = 0; i < plan->n; ++i) {
@@ -275,6 +277,11 @@ static size_t ionic_pipeline_cuda_scheduler_loop(
     }
     pipeline->device_buffer = device_buffer;
     pipeline->device_buffer_size = n_bytes;
+
+    if (ctx->pg) {
+        ctx->pg->device_ptrs[ctx->rank] = device_buffer;
+        ionic_group_wait(ctx->pg);
+    }
 
     struct ionic_logical_segment *segments = calloc(plan->n, sizeof(struct ionic_logical_segment));
     if (!segments) {
@@ -325,14 +332,14 @@ static size_t ionic_pipeline_cuda_scheduler_loop(
     return n_fetched;
 }
 
-static void ionic_pipeline_cuda_execute(struct ionic_context *ctx, struct ionic_pipeline *pipeline, const struct ionic_sharding_plan *plan, const unsigned short rank) {
+static void ionic_pipeline_cuda_execute(struct ionic_context *ctx, struct ionic_pipeline *pipeline, const struct ionic_sharding_plan *plan, unsigned short rank) {
     if (ionic_has_error(&ctx->error)) return;
 
     struct ionic_pipeline_cuda *pipeline_ = (struct ionic_pipeline_cuda *)pipeline;
 
-    IONIC_INFO(&ctx->logger, pipeline_->tag, "execute rank=%hu, n=%zu", rank, plan->n);
+    IONIC_INFO(&ctx->logger, pipeline_->tag, "execute rank=%hu, n=%zu", ctx->rank, plan->n);
 
-    ionic_pipeline_cuda_scheduler_loop(ctx, pipeline_, plan, rank);
+    ionic_pipeline_cuda_scheduler_loop(ctx, pipeline_, plan);
 }
 
 struct ionic_pipeline *ionic_pipeline_cuda_create(struct ionic_context *ctx, unsigned short world_size) {

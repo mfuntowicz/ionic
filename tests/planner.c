@@ -6,7 +6,7 @@
 static int test_planner_init(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 4, 0, 1);
     if (!planner)
@@ -28,7 +28,7 @@ static int test_planner_init(void)
 static int test_planner_shard_replicated(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 2, 0, 1);
     if (!planner)
@@ -59,7 +59,7 @@ static int test_planner_shard_replicated(void)
 static int test_planner_shard_non_replicated_fails_on_world_size_1(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 1, 0, 1);
     if (!planner)
@@ -79,7 +79,7 @@ static int test_planner_shard_non_replicated_fails_on_world_size_1(void)
 static int test_planner_too_many_shards(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 1, 0, 1);
     if (!planner)
@@ -106,7 +106,7 @@ static int test_planner_too_many_shards(void)
 static int test_materialize_plan_replicated(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 2, 0, 1);
     if (!planner)
@@ -139,7 +139,7 @@ static int test_materialize_plan_replicated(void)
 static int test_materialize_plan_without_all_shards_fails(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 2, 0, 1);
     if (!planner)
@@ -165,7 +165,7 @@ static int test_materialize_plan_without_all_shards_fails(void)
 static int test_plan_specs_values(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 1, 0, 1);
     if (!planner)
@@ -200,7 +200,7 @@ static int test_plan_specs_values(void)
 static int test_plan_specs_is_loaded_initially_false(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 1, 0, 1);
     if (!planner)
@@ -226,7 +226,7 @@ static int test_plan_specs_is_loaded_initially_false(void)
 static int test_plan_specs_is_loaded_after_update(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 1, 0, 1);
     if (!planner)
@@ -260,7 +260,7 @@ static int test_plan_specs_is_loaded_after_update(void)
 static int test_plan_specs_world_size_greater_than_one(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 1, 0, 4);
     if (!planner)
@@ -296,7 +296,7 @@ static int test_plan_specs_world_size_greater_than_one(void)
 static int test_materialize_plan_rowwise(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 1, 0, 2);
     if (!planner)
@@ -342,7 +342,7 @@ static int test_materialize_plan_rowwise(void)
 static int test_materialize_plan_rowwise_uneven(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 1, 0, 3);
     if (!planner)
@@ -383,7 +383,7 @@ static int test_materialize_plan_rowwise_uneven(void)
 static int test_materialize_plan_colwise(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 1, 0, 2);
     if (!planner)
@@ -429,7 +429,7 @@ static int test_materialize_plan_colwise(void)
 static int test_materialize_plan_colwise_1d(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 1, 0, 3);
     if (!planner)
@@ -470,7 +470,7 @@ static int test_materialize_plan_colwise_1d(void)
 static int test_materialize_plan_unsupported_sharding(void)
 {
     ionic_context_t ctx;
-    ionic_context_init(&ctx, ionic_cpu_device(0), NULL);
+    ionic_context_init(&ctx, ionic_cpu_device(0), NULL, 0, 1);
 
     struct ionic_planner *planner = ionic_planner_init(&ctx, 1, 0, 2);
     if (!planner)

@@ -3,7 +3,7 @@
 
 #include <assert.h>
 #include <stddef.h>
-#include <stdatomic.h>
+
 
 #define IONIC_FALSE 0u
 typedef unsigned char ionic_bool;
@@ -52,16 +52,7 @@ typedef struct ionic_allocator {
     void (*free)(struct ionic_context *ctx, void *ptr, enum ionic_allocation_kind kind);
 } ionic_allocator_t;
 
-#define IONIC_BARRIER_MAX_IDENT 58
-
-typedef struct ionic_barrier {
-    atomic_uint   steps;
-    atomic_uchar  ready;     // max 16 devices per host
-    unsigned char total;     // max 16 devices per host
-    char          identifier[IONIC_BARRIER_MAX_IDENT]; // POSIX shm name, e.g. "/ionic_barrier_0"
-} ionic_barrier_t;
-
-static_assert(sizeof(ionic_barrier_t) == 64, "ionic_barrier_t must be cache line sized");
+struct ionic_group;
 
 typedef enum ionic_data_type {
     IONIC_DATA_TYPE_BOOL,
