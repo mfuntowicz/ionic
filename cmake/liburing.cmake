@@ -28,7 +28,7 @@ if(NOT liburing_POPULATED)
 
     add_custom_command(
         OUTPUT "${liburing_SOURCE_DIR}/src/liburing.a"
-        COMMAND make -j
+        COMMAND make -j library
         WORKING_DIRECTORY ${liburing_SOURCE_DIR}
         # This command depends on the Makefile existing (step 2)
         DEPENDS "${liburing_SOURCE_DIR}/Makefile"
