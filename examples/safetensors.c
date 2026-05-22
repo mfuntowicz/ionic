@@ -38,7 +38,7 @@ int main(int argc, char **argv)
         }
     }
 
-    ionic_context_init(&ctx, device, NULL);
+    ionic_context_init(&ctx, device, NULL, 0, 1);
     ionic_safetensors_init(&registry);
     ionic_safetensors_discover_tensors(&ctx, &registry, argv[1]);
 
