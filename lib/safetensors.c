@@ -20,8 +20,13 @@
 static inline size_t ionic_path_parent(const char *path, char *const dst, size_t dst_size)
 {
     const char *sep = strrchr(path, '/');
-    if (!sep)
-        return 0;
+    if (!sep) {
+        const char dot_slash[] = "./";
+        const size_t len = sizeof(dot_slash) - 1;
+        if (len >= dst_size) return 0;
+        memcpy(dst, dot_slash, len + 1);
+        return len;
+    }
 
     size_t len = (size_t)(sep - path + 1);
     if (len >= dst_size)
@@ -354,16 +359,9 @@ size_t ionic_safetensors_discover_tensors(ionic_context_t *ctx, ionic_safetensor
     if(doc) {
         IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_SAFETENSORS, "index path=%s", path);
 
-        char resolved[PATH_MAX];
-        char *abs = realpath(path, resolved);
-        if (!abs) {
-            ionic_set_error(ctx, IONIC_SYS_ERR_WITH_MSG(errno, "realpath failed"));
-            yyjson_doc_free(doc);
-            return 0;
-        }
-
         char parent[PATH_MAX];
-        size_t parent_len = ionic_path_parent(abs, parent, sizeof(parent));
+        size_t parent_len = ionic_path_parent(path, parent, sizeof(parent));
+
         yyjson_val *root = yyjson_doc_get_root(doc);
         n_tensors = ionic_safetensors_discover_tensors_from_index(ctx, registry, root, parent, parent_len);
 
