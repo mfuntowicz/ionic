@@ -14,12 +14,12 @@ struct ionic_pipeline *ionic_pipeline_probe(struct ionic_context *ctx, unsigned 
 {
 #ifdef __IONIC_CUDA_ENABLED__
     if(ctx->device.kind == IONIC_DEVICE_CUDA) {
-        IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_PLANNER, "probe -> device=CUDA, world_size=1");
+        IONIC_INFO(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "probe -> device=CUDA, world_size=%hu", world_size);
         return ionic_pipeline_cuda_create(ctx, world_size);
     }
 #endif
 
-    IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PLANNER, "unsupported topology device=%s, world_size=%hu", IONIC_DEVICE_LITERAL[ctx->device.kind], world_size);
+    IONIC_ERROR(&ctx->logger, IONIC_EVENT_TAG_PIPELINE, "unsupported topology device=%s, world_size=%hu", IONIC_DEVICE_LITERAL[ctx->device.kind], world_size);
     ionic_set_error(ctx, IONIC_ERR_WITH_MSG(IONIC_ERROR_UNSUPPORTED_TOPOLOGY, "unsupported topology"));
     return NULL;
 }
